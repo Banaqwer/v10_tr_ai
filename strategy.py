@@ -16,6 +16,9 @@ class StrategyEngine:
     cfg: any
     model: any  # any object with predict_signal(df_row) -> float in [-1, 1]
 
+    # ---------------------------------------------------------
+    # Core signal computation (continuous in [-1, 1])
+    # ---------------------------------------------------------
     def compute_signal(self, row: pd.Series) -> float:
         """
         Use the ML model to compute a continuous signal in [-1, +1].
@@ -23,6 +26,19 @@ class StrategyEngine:
         signal = self.model.predict_signal(row)
         return float(signal)
 
+    # ---------------------------------------------------------
+    # Backtester API compatibility
+    # ---------------------------------------------------------
+    def generate_signal(self, row: pd.Series) -> float:
+        """
+        Wrapper expected by the Backtester.
+        Simply calls compute_signal(row).
+        """
+        return self.compute_signal(row)
+
+    # ---------------------------------------------------------
+    # Map continuous signal to discrete position
+    # ---------------------------------------------------------
     def to_position(self, signal: float) -> int:
         """
         Convert continuous signal to discrete position:
@@ -40,16 +56,20 @@ class StrategyEngine:
         else:
             return 0
 
+    # ---------------------------------------------------------
+    # Vectorised position generation over a DataFrame
+    # ---------------------------------------------------------
     def generate_positions(self, df: pd.DataFrame) -> pd.Series:
         """
         Apply the strategy over a DataFrame of features, returning
         a Series of discrete positions indexed like df.
         """
-        signals = []
+        positions = []
         for idx, row in df.iterrows():
             s = self.compute_signal(row)
             pos = self.to_position(s)
-            signals.append(pos)
+            positions.append(pos)
 
-        positions = pd.Series(signals, index=df.index, name="position")
+        positions = pd.Series(positions, index=df.index, name="position")
         return positions
+
