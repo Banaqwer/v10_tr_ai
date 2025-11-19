@@ -2,7 +2,7 @@
 
 from config import BotConfig
 from data_engine import MarketDataConfig, MarketDataEngine
-from feature_engine import FeatureEngineer
+from feature_engine import FeatureEngine
 from regime_engine import RegimeEngine
 from ml_models import LabelBuilder, MLSignalModel
 from strategy import StrategyEngine
