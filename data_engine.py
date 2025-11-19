@@ -1,170 +1,168 @@
 # data_engine.py
+#
+# V10 Market Data Engine – simplified and made timeframe-aware.
+# Works with DAILY ("1d") or INTRADAY ("1h" → "60m") depending on cfg.timeframe.
+#
+# It:
+#   - downloads data from Yahoo Finance using yfinance
+#   - uses cfg.timeframe to choose interval
+#   - caches raw data to disk (data/raw/)
+#   - returns a clean DataFrame with columns:
+#       ["open", "high", "low", "close", "volume"]
+#
 
-import os
-import datetime as dt
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union
+from datetime import datetime
 
-import numpy as np
 import pandas as pd
+import yfinance as yf
 
-try:
-    import yfinance as yf
-    HAS_YFINANCE = True
-except ImportError:
-    HAS_YFINANCE = False
+from config import BotConfig
 
+
+# ---------------------------------------------------------------------------
+# Config wrapper specific to market data
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MarketDataConfig:
     symbols: List[str]
-    timeframe: str
+    timeframe: str          # "1d" or "1h"
     data_dir: str
-    raw_subdir: str = "raw"
-    processed_subdir: str = "processed"
-    default_start: str = "2018-01-01"
-    default_end: Optional[str] = None
-    tz: str = "UTC"
-    max_missing_ratio: float = 0.05
-
-    @property
-    def raw_path(self):
-        return os.path.join(self.data_dir, self.raw_subdir)
-
-    @property
-    def processed_path(self):
-        return os.path.join(self.data_dir, self.processed_subdir)
+    default_start: str
+    default_end: str
 
 
-def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-
-def parse_date(date_str):
-    if date_str is None:
-        return dt.datetime.utcnow()
-    return dt.datetime.fromisoformat(date_str)
-
-
-class DataDownloader:
-    def __init__(self, config):
-        self.config = config
-        ensure_dir(config.raw_path)
-
-    def _local_raw_filename(self, symbol):
-        safe = symbol.replace("=", "").replace("/", "_")
-        return os.path.join(self.config.raw_path, f"{safe}_{self.config.timeframe}_raw.csv")
-
-    def _resample(self, df, rule):
-        ohlc = {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-        out = df.resample(rule).agg(ohlc)
-        out.dropna(inplace=True)
-        return out
-
-    def _download_from_yfinance(self, symbol, start, end):
-        if not HAS_YFINANCE:
-            raise ImportError("yfinance not installed")
-
-        interval_map = {
-            "1T": "1m",
-            "5T": "5m",
-            "15T": "15m",
-            "1H": "60m",
-            "4H": "60m",
-            "1D": "1d"
-        }
-        interval = interval_map.get(self.config.timeframe, "60m")
-
-        df = yf.download(symbol, start=start, end=end, interval=interval)
-        if df.empty:
-            raise ValueError(f"No data for {symbol}")
-
-        df = df.rename(columns={
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Volume": "volume"
-        })
-
-        df.index = df.index.tz_localize("UTC")
-
-        df = self._resample(df, self.config.timeframe)
-        return df
-
-    def fetch_raw(self, symbol, start=None, end=None, force_download=False):
-        start_dt = parse_date(start or self.config.default_start)
-        end_dt = parse_date(end or self.config.default_end)
-
-        fname = self._local_raw_filename(symbol)
-
-        if os.path.exists(fname) and not force_download:
-            df = pd.read_csv(fname, parse_dates=["datetime"], index_col="datetime")
-            df.index = df.index.tz_localize(self.config.tz)
-            return df
-
-        df = self._download_from_yfinance(symbol, start_dt, end_dt)
-        df.index.name = "datetime"
-        df.to_csv(fname)
-        return df
-
-
-class DataCleaner:
-    def __init__(self, config):
-        self.config = config
-
-    def add_returns(self, df):
-        df["ret"] = df["close"].pct_change()
-        df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
-        return df
-
-    def add_vol(self, df):
-        df["vol"] = df["log_ret"].rolling(48).std()
-        return df
-
-    def forward_fill(self, df):
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].ffill()
-        return df
-
-    def clean(self, df, symbol):
-        df = self.forward_fill(df)
-        df = self.add_returns(df)
-        df = df.replace([np.inf, -np.inf], np.nan).dropna()
-        df = self.add_vol(df)
-        return df
-
+# ---------------------------------------------------------------------------
+# MarketDataEngine
+# ---------------------------------------------------------------------------
 
 class MarketDataEngine:
-    def __init__(self, config):
-        self.config = config
-        ensure_dir(config.data_dir)
-        ensure_dir(config.raw_path)
-        ensure_dir(config.processed_path)
+    def __init__(self, mdc: MarketDataConfig):
+        self.cfg = mdc
+        base = Path(mdc.data_dir)
+        self.base_dir = base
+        self.raw_dir = base / "raw"
+        self.processed_dir = base / "processed"
 
-        self.downloader = DataDownloader(config)
-        self.cleaner = DataCleaner(config)
+        # ensure directories exist
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
 
-    def _processed_filename(self, symbol):
-        safe = symbol.replace("=", "").replace("/", "_")
-        return os.path.join(self.config.processed_path, f"{safe}_{self.config.timeframe}_proc.csv")
+    # ---------- helpers ----------
 
-    def get_history(self, symbol, start=None, end=None, processed=True, force_refresh=False):
-        fname = self._processed_filename(symbol)
+    @staticmethod
+    def _parse_date(dt: Union[str, datetime]) -> datetime:
+        if isinstance(dt, datetime):
+            return dt
+        return datetime.fromisoformat(dt)
 
-        if processed and os.path.exists(fname) and not force_refresh:
-            df = pd.read_csv(fname, parse_dates=["datetime"], index_col="datetime")
-            df.index = df.index.tz_localize(self.config.tz)
+    def _symbol_filename(self, symbol: str) -> str:
+        """
+        Turn 'EURUSD=X' into a safe filename like 'EURUSD=X_1d.csv'
+        """
+        safe = symbol.replace("/", "_").replace("=", "_")
+        return f"{safe}_{self.cfg.timeframe}.csv"
+
+    # ---------- Yahoo download ----------
+
+    def _download_from_yfinance(
+        self,
+        symbol: str,
+        start_dt: datetime,
+        end_dt: datetime
+    ) -> pd.DataFrame:
+        """
+        Download from Yahoo Finance using the timeframe from our config.
+
+        For V10-Daily:
+            cfg.timeframe = "1d"  -> interval="1d"
+        If later we revert to intraday:
+            cfg.timeframe = "1h"  -> interval="60m"
+        """
+        interval = self.cfg.timeframe
+        if interval == "1h":
+            interval = "60m"  # yfinance intraday symbol
+
+        df = yf.download(
+            symbol,
+            start=start_dt,
+            end=end_dt,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if df is None or df.empty:
+            raise ValueError(f"No data for {symbol}")
+
+        # normalize column names
+        df = df.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Adj Close": "adj_close",
+                "Volume": "volume",
+            }
+        )
+
+        # keep only what we need
+        cols = ["open", "high", "low", "close", "volume"]
+        df = df[cols]
+        df = df.dropna()
+
+        # ensure datetime index and sort
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        return df
+
+    # ---------- public API ----------
+
+    def get_history(
+        self,
+        symbol: str,
+        start: Optional[Union[str, datetime]] = None,
+        end: Optional[Union[str, datetime]] = None,
+        force_download: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Main entry point used by main.py and the rest of V10.
+
+        - symbol: "EURUSD=X" etc.
+        - start/end: optional override of default dates
+        - force_download: if True, ignore cache and re-pull from Yahoo
+        """
+        if start is None:
+            start = self.cfg.default_start
+        if end is None:
+            end = self.cfg.default_end
+
+        start_dt = self._parse_date(start)
+        end_dt = self._parse_date(end)
+
+        # path for cached raw data
+        fname = self._symbol_filename(symbol)
+        fpath = self.raw_dir / fname
+
+        if fpath.exists() and not force_download:
+            df = pd.read_csv(fpath, parse_dates=["timestamp"])
+            df = df.set_index("timestamp")
+            df = df.sort_index()
             return df
 
-        raw = self.downloader.fetch_raw(symbol, start, end, force_download=force_refresh)
-        clean = self.cleaner.clean(raw, symbol)
-        clean.index.name = "datetime"
-        clean.to_csv(fname)
-        return clean
+        # download fresh
+        df = self._download_from_yfinance(symbol, start_dt, end_dt)
+
+        # cache to disk
+        tmp = df.copy()
+        tmp["timestamp"] = tmp.index
+        tmp.to_csv(fpath, index=False)
+
+        return df
