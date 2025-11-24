@@ -58,7 +58,7 @@ SL_ATR_MULT = 1.0
 
 CCT_WINDOW_DAYS = 90
 CCT_CHUNK_SIZE = 15                    # 90 days → 6 chunks
-CCT_EMBED_DIM = 32                    # embedding dimension per chunk
+CCT_EMBED_DIM = 32                     # embedding dimension per chunk
 
 
 # ================================================================
@@ -67,8 +67,8 @@ CCT_EMBED_DIM = 32                    # embedding dimension per chunk
 
 TRANSFORMER_LAYERS = 4
 TRANSFORMER_HEADS = 4
-TRANSFORMER_MODEL_DIM = 64           # dimension of transformer tokens
-TRANSFORMER_FEEDFORWARD_DIM = 128    # inner feed-forward layer
+TRANSFORMER_MODEL_DIM = 64            # dimension of transformer tokens
+TRANSFORMER_FEEDFORWARD_DIM = 128     # inner feed-forward layer
 TRANSFORMER_DROPOUT = 0.1
 
 
@@ -128,7 +128,12 @@ VERBOSE = True
 
 @dataclass
 class V10TRConfig:
+    # full universe (multi-symbol backtest)
     universe: list = field(default_factory=lambda: UNIVERSE)
+
+    # default single-symbol to use when main.py calls cfg.symbol
+    # (you can change this to any element of UNIVERSE)
+    symbol: str = UNIVERSE[0]
 
     timeframe: str = TIMEFRAME
     start_date: str = START_DATE
