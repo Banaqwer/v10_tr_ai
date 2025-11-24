@@ -1,152 +1,238 @@
-# ================================================================
-#  DATA ENGINE — V10-TR CCT-90
-#  Fetches daily OHLCV data from Yahoo Finance (Render-safe)
-# ================================================================
-
+# data_engine.py
 import os
-import time
-import pickle
-from dataclasses import dataclass
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
 import pandas as pd
-import yfinance as yf
+import requests
 
-from config import V10TRConfig
-from utils import logger
-
-
-# ================================================================
-#  SIMPLE DISK CACHE (PER SYMBOL)
-# ================================================================
-
-def _cache_path(symbol: str) -> str:
-    safe = symbol.replace("=", "_").replace("^", "_")
-    return f"cache_{safe}.pkl"
+from utils import logger as _logger
 
 
-def load_from_cache(symbol: str):
-    path = _cache_path(symbol)
-    if os.path.exists(path):
-        try:
-            with open(path, "rb") as f:
-                df = pickle.load(f)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                logger.info(f"[DATA] Loaded {symbol} from cache {path}")
-                return df
-        except Exception as e:
-            logger.warning(f"[DATA] Failed to load cache for {symbol}: {e}")
-    return None
+log = _logger.get_logger("DATA") if hasattr(_logger, "get_logger") else _logger
 
 
-def save_to_cache(symbol: str, df: pd.DataFrame):
-    path = _cache_path(symbol)
-    try:
-        with open(path, "wb") as f:
-            pickle.dump(df, f)
-        logger.info(f"[DATA] Saved {symbol} to cache {path}")
-    except Exception as e:
-        logger.warning(f"[DATA] Failed to save cache for {symbol}: {e}")
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+def _get_env(name: str, default: Optional[str] = None) -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
 
-# ================================================================
-#  DATA ENGINE
-# ================================================================
+def _oanda_base_url() -> str:
+    """
+    Choose the correct OANDA API host based on OANDA_ENV / OANDA_DOMAIN.
+    practice -> api-fxpractice.oanda.com
+    live     -> api-fxtrade.oanda.com
+    """
+    env = (os.getenv("OANDA_ENV") or os.getenv("OANDA_DOMAIN") or "practice").lower()
+    if env == "live":
+        return "https://api-fxtrade.oanda.com/v3"
+    return "https://api-fxpractice.oanda.com/v3"
 
-@dataclass
+
+def _granularity_from_timeframe(tf: str) -> str:
+    """
+    Map our config timeframe to OANDA candle granularity.
+    Feel free to adjust if you change your config.
+    """
+    tf = tf.upper()
+    mapping = {
+        "M1": "M1",
+        "M5": "M5",
+        "M15": "M15",
+        "M30": "M30",
+        "H1": "H1",
+        "H4": "H4",
+        "D": "D",
+        "1D": "D",
+    }
+    if tf not in mapping:
+        raise ValueError(f"Unsupported timeframe for OANDA: {tf}")
+    return mapping[tf]
+
+
+# ------------------------------------------------------------
+# DataEngine – OANDA version
+# ------------------------------------------------------------
+
 class DataEngine:
-    cfg: V10TRConfig
+    """
+    V10-TR data engine that pulls candles directly from OANDA.
 
-    # ------------------------------------------------------------
-    #  PUBLIC METHOD: get_history(symbol) → OHLCV DataFrame
-    # ------------------------------------------------------------
-    def get_history(self, symbol: str) -> pd.DataFrame:
+    - No Yahoo Finance.
+    - Returns a DataFrame with index = datetime and columns:
+      [Open, High, Low, Close, Volume]
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.symbol = cfg.symbol        # OANDA instrument, e.g. "EUR_USD", "XAU_USD"
+        self.timeframe = cfg.timeframe  # e.g. "D", "H1", "M5"
+        self.max_retries = getattr(cfg, "data_max_retries", 3)
+        self.retry_delay = getattr(cfg, "data_retry_delay", 2.0)
+
+        self._session = requests.Session()
+        self._base_url = _oanda_base_url()
+        self._token = _get_env("OANDA_TOKEN")
+        self._account_id = _get_env("OANDA_ACCOUNT_ID")
+
+        log.info(
+            f"[DATA] Using OANDA data source | env={os.getenv('OANDA_ENV', 'practice')}, "
+            f"symbol={self.symbol}, timeframe={self.timeframe}"
+        )
+
+    # ------------------------------------------------------------------    # Public API used by Backtester
+    # ------------------------------------------------------------------
+    def get_history(self, symbol: Optional[str] = None) -> pd.DataFrame:
         """
-        Returns a clean daily OHLCV DataFrame for the given symbol.
-
-        Columns: Open, High, Low, Close, Volume
-        Index: DatetimeIndex
+        Fetch historical candles for the given symbol (or cfg.symbol if None),
+        clean them, and return OHLCV DataFrame.
         """
+        inst = symbol or self.symbol
+        log.info(f"[DATA] Requesting OANDA history for {inst}")
 
-        # 1) Try cache
-        cached = load_from_cache(symbol)
-        if cached is not None:
-            return cached
+        raw_df = self._download_from_oanda(inst)
+        df = self._clean_dataframe(raw_df)
 
-        # 2) Download from Yahoo with retries
-        df = self._download_from_yahoo(symbol)
-
-        # 3) Clean & standardize
-        df = self._clean_dataframe(df)
-
-        # 4) Save to cache
-        save_to_cache(symbol, df)
-
+        log.info(f"[DATA] Loaded {len(df)} bars for {inst}")
         return df
 
-    # ------------------------------------------------------------
-    #  INTERNAL: download via yfinance with basic retry
-    # ------------------------------------------------------------
-    def _download_from_yahoo(self, symbol: str) -> pd.DataFrame:
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(
-                    f"[DATA] Downloading {symbol} (attempt {attempt}/{max_retries})"
-                )
-                df = yf.download(
-                    symbol,
-                    start=self.cfg.start_date,
-                    end=self.cfg.end_date,
-                    interval=self.cfg.timeframe,
-                    auto_adjust=False,
-                    progress=False,
-                )
-                if df is not None and not df.empty:
-                    return df
-                else:
-                    logger.warning(f"[DATA] Empty data for {symbol} on attempt {attempt}")
-            except Exception as e:
-                logger.warning(f"[DATA] Error downloading {symbol}: {e}")
-            time.sleep(2.0)
+    # ------------------------------------------------------------------    # OANDA download logic
+    # ------------------------------------------------------------------
+    def _download_from_oanda(self, instrument: str) -> pd.DataFrame:
+        """
+        Download all candles between cfg.start_date and cfg.end_date
+        (inclusive) from OANDA, chunking if necessary.
+        """
 
-        raise RuntimeError(f"[DATA] Failed to download data for {symbol} after retries")
+        # Expect ISO dates like "2015-01-01" in cfg; fallback if absent.
+        start_date = datetime.fromisoformat(getattr(self.cfg, "start_date", "2015-01-01")).replace(
+            tzinfo=timezone.utc
+        )
+        end_date = datetime.fromisoformat(getattr(self.cfg, "end_date", datetime.utcnow().strftime("%Y-%m-%d"))).replace(
+            tzinfo=timezone.utc
+        ) + timedelta(days=1)  # include last day
 
-    # ------------------------------------------------------------
-    #  INTERNAL: standardize columns & clean
-    # ------------------------------------------------------------
-    def _clean_dataframe(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        df = df_raw.copy()
+        granularity = _granularity_from_timeframe(self.timeframe)
 
-        # Standardize column names
-        col_map = {
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Adj Close": "Close",   # prefer Close but fall back if needed
-            "Volume": "Volume",
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
         }
 
-        # Only keep known columns
-        keep_cols = [c for c in df.columns if c in col_map]
-        df = df[keep_cols].rename(columns=col_map)
+        url = f"{self._base_url}/instruments/{instrument}/candles"
 
-        # If "Close" is missing but "Adj Close" exists
-        if "Close" not in df.columns and "Adj Close" in df_raw.columns:
-            df["Close"] = df_raw["Adj Close"]
+        all_rows: List[dict] = []
+        since = start_date
 
-        # Ensure all required columns exist, fill missing with ffill
-        for col in ["Open", "High", "Low", "Close"]:
-            if col not in df.columns:
-                df[col] = df["Close"]
-        if "Volume" not in df.columns:
-            df["Volume"] = 0.0
+        log.info(
+            f"[DATA] OANDA candles | instrument={instrument}, "
+            f"granularity={granularity}, start={start_date.date()}, end={end_date.date()}"
+        )
 
-        # Drop rows without close price
-        df = df.dropna(subset=["Close"])
+        # OANDA limit is 5000 candles / request. We chunk by time.
+        while since < end_date:
+            params = {
+                "from": since.isoformat().replace("+00:00", "Z"),
+                "to": end_date.isoformat().replace("+00:00", "Z"),
+                "granularity": granularity,
+                "price": "M",  # mid prices
+                "count": 5000,
+            }
 
-        # Sort by date index
-        df = df.sort_index()
+            for attempt in range(1, self.max_retries + 1):
+                resp = self._session.get(url, headers=headers, params=params, timeout=30)
+                if resp.status_code == 429:
+                    log.warning("[DATA] OANDA rate limit. Sleeping before retry...")
+                    import time as _time
+                    _time.sleep(self.retry_delay * attempt)
+                    continue
+                if not resp.ok:
+                    log.warning(
+                        f"[DATA] OANDA request failed (status={resp.status_code}) "
+                        f"attempt {attempt}/{self.max_retries}: {resp.text[:200]}"
+                    )
+                    if attempt == self.max_retries:
+                        resp.raise_for_status()
+                    import time as _time
+                    _time.sleep(self.retry_delay * attempt)
+                    continue
 
+                data = resp.json()
+                candles = data.get("candles", [])
+                if not candles:
+                    log.warning("[DATA] OANDA returned 0 candles for this chunk.")
+                    return pd.DataFrame()  # let cleaner handle KeyError if empty
+
+                all_rows.extend(candles)
+                last_time_str = candles[-1]["time"]
+                last_dt = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
+
+                # Move cursor forward by one candle to avoid duplicates
+                since = last_dt + timedelta(seconds=1)
+                break  # success, exit retry loop
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        # Build DataFrame
+        records = []
+        for c in all_rows:
+            if not c.get("complete", True):
+                continue
+            t = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+            mid = c.get("mid") or c.get("ask") or c.get("bid")
+            if mid is None:
+                continue
+            records.append(
+                {
+                    "Datetime": t,
+                    "Open": float(mid["o"]),
+                    "High": float(mid["h"]),
+                    "Low": float(mid["l"]),
+                    "Close": float(mid["c"]),
+                    "Volume": int(c.get("volume", 0)),
+                }
+            )
+
+        df = pd.DataFrame.from_records(records)
+        if df.empty:
+            return df
+
+        df.set_index("Datetime", inplace=True)
+        df.sort_index(inplace=True)
         return df
 
+    # ------------------------------------------------------------------    # Cleaning
+    # ------------------------------------------------------------------
+    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Standardize columns & drop bad rows so the rest of the AI
+        (features, regime engine, etc.) can stay unchanged.
+        """
+
+        if df.empty:
+            raise KeyError(
+                "Received empty dataframe from OANDA. "
+                "Check symbol, timeframe, and date range."
+            )
+
+        # Ensure required columns exist
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in df.columns:
+                raise KeyError(f"Expected column '{col}' in price data, got {df.columns.tolist()}")
+
+        # Drop rows with missing close
+        df = df.dropna(subset=["Close"])
+
+        # Optional: keep only OHLCV
+        keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[keep_cols]
+
+        return df

@@ -1,37 +1,32 @@
 # ================================================================
-#  V10-TR CCT-90 CONFIGURATION FILE
-#  Full Transformer + Compressed Context + 5 Experts
-#  DAILY timeframe FX trading AI (Render-ready)
+#  V10-TR CCT-90 CONFIGURATION FILE (OANDA VERSION)
 # ================================================================
 
 from dataclasses import dataclass, field
 from datetime import datetime
 
-
 # ================================================================
-#  MARKET UNIVERSE
+#  MARKET UNIVERSE (OANDA symbols)
 # ================================================================
 
 UNIVERSE = [
-    "EURUSD=X",
-    "GBPUSD=X",
-    "USDJPY=X",
-    "AUDUSD=X",
+    "EUR_USD",
+    "GBP_USD",
+    "USD_JPY",
+    "AUD_USD",
 ]
 
-
 # ================================================================
-#  TIMEFRAME & DATA RANGE
+#  TIMEFRAME & DATA RANGE (OANDA compatible)
 # ================================================================
 
-TIMEFRAME = "1d"
+TIMEFRAME = "D"   # OANDA uses D, H1, M5, etc.
 
 START_DATE = "2010-01-01"
 END_DATE = datetime.utcnow().strftime("%Y-%m-%d")
 
-
 # ================================================================
-#  TRAIN / TEST SPLITS (rolling window backtest)
+#  TRAIN / TEST SPLITS
 # ================================================================
 
 TRAIN_YEARS = 4
@@ -40,9 +35,8 @@ TEST_YEARS = 1
 TRAIN_WINDOW_DAYS = TRAIN_YEARS * 252
 TEST_WINDOW_DAYS = TEST_YEARS * 252
 
-
 # ================================================================
-#  LABEL SETTINGS (TP/SL intraday simulation)
+#  LABEL SETTINGS (TP/SL)
 # ================================================================
 
 FORWARD_HORIZON_DAYS = 10
@@ -51,36 +45,32 @@ ATR_WINDOW = 14
 TP_ATR_MULT = 2.0
 SL_ATR_MULT = 1.0
 
-
 # ================================================================
-#  CCT-90 EMBEDDING SETTINGS
+#  CCT-90 SETTINGS
 # ================================================================
 
 CCT_WINDOW_DAYS = 90
-CCT_CHUNK_SIZE = 15                    # 90 days → 6 chunks
-CCT_EMBED_DIM = 32                     # embedding dimension per chunk
-
+CCT_CHUNK_SIZE = 15
+CCT_EMBED_DIM = 32
 
 # ================================================================
-#  TRANSFORMER SETTINGS (Render-safe CPU version)
+#  TRANSFORMER SETTINGS
 # ================================================================
 
 TRANSFORMER_LAYERS = 4
 TRANSFORMER_HEADS = 4
-TRANSFORMER_MODEL_DIM = 64            # dimension of transformer tokens
-TRANSFORMER_FEEDFORWARD_DIM = 128     # inner feed-forward layer
+TRANSFORMER_MODEL_DIM = 64
+TRANSFORMER_FEEDFORWARD_DIM = 128
 TRANSFORMER_DROPOUT = 0.1
-
 
 # ================================================================
 #  REGIME SETTINGS
 # ================================================================
 
-N_REGIMES = 3   # Trend / Range / Shock
-
+N_REGIMES = 3
 
 # ================================================================
-#  EXPERT MODELS SETTINGS (5 experts)
+#  EXPERT SETTINGS
 # ================================================================
 
 EXPERT_TYPES = [
@@ -98,29 +88,26 @@ GB_ESTIMATORS = 200
 GB_LEARNING_RATE = 0.05
 GB_MAX_DEPTH = 3
 
-
 # ================================================================
 #  RISK SETTINGS
 # ================================================================
 
 INITIAL_EQUITY = 100_000.0
 
-RISK_PER_TRADE = 0.0075          # 0.75%
-MAX_RISK_PER_SYMBOL = 0.02       # 2%
-MAX_PORTFOLIO_RISK = 0.05        # 5%
+RISK_PER_TRADE = 0.0075
+MAX_RISK_PER_SYMBOL = 0.02
+MAX_PORTFOLIO_RISK = 0.05
 
-DAILY_MAX_DRAWDOWN = 0.02        # stop trading symbol for the day
+DAILY_MAX_DRAWDOWN = 0.02
 
 SLIPPAGE_PIPS = 0.2
 COMMISSION_PER_TRADE = 0.0
 
-
 # ================================================================
-#  LOGGING SETTINGS
+#  LOGGING
 # ================================================================
 
 VERBOSE = True
-
 
 # ================================================================
 #  MASTER CONFIG OBJECT
@@ -128,12 +115,10 @@ VERBOSE = True
 
 @dataclass
 class V10TRConfig:
-    # full universe (multi-symbol backtest)
     universe: list = field(default_factory=lambda: UNIVERSE)
 
-    # default single-symbol to use when main.py calls cfg.symbol
-    # (you can change this to any element of UNIVERSE)
-    symbol: str = UNIVERSE[0]
+    # default symbol
+    symbol: str = UNIVERSE[0]  # EUR_USD
 
     timeframe: str = TIMEFRAME
     start_date: str = START_DATE
