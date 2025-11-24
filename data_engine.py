@@ -1,168 +1,152 @@
-# data_engine.py
-#
-# V10 Market Data Engine – simplified and made timeframe-aware.
-# Works with DAILY ("1d") or INTRADAY ("1h" → "60m") depending on cfg.timeframe.
-#
-# It:
-#   - downloads data from Yahoo Finance using yfinance
-#   - uses cfg.timeframe to choose interval
-#   - caches raw data to disk (data/raw/)
-#   - returns a clean DataFrame with columns:
-#       ["open", "high", "low", "close", "volume"]
-#
+# ================================================================
+#  DATA ENGINE — V10-TR CCT-90
+#  Fetches daily OHLCV data from Yahoo Finance (Render-safe)
+# ================================================================
 
-from __future__ import annotations
-
+import os
+import time
+import pickle
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Union
-from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
 
-from config import BotConfig
+from config import V10TRConfig
+from utils import logger
 
 
-# ---------------------------------------------------------------------------
-# Config wrapper specific to market data
-# ---------------------------------------------------------------------------
+# ================================================================
+#  SIMPLE DISK CACHE (PER SYMBOL)
+# ================================================================
+
+def _cache_path(symbol: str) -> str:
+    safe = symbol.replace("=", "_").replace("^", "_")
+    return f"cache_{safe}.pkl"
+
+
+def load_from_cache(symbol: str):
+    path = _cache_path(symbol)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                df = pickle.load(f)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                logger.info(f"[DATA] Loaded {symbol} from cache {path}")
+                return df
+        except Exception as e:
+            logger.warning(f"[DATA] Failed to load cache for {symbol}: {e}")
+    return None
+
+
+def save_to_cache(symbol: str, df: pd.DataFrame):
+    path = _cache_path(symbol)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(df, f)
+        logger.info(f"[DATA] Saved {symbol} to cache {path}")
+    except Exception as e:
+        logger.warning(f"[DATA] Failed to save cache for {symbol}: {e}")
+
+
+# ================================================================
+#  DATA ENGINE
+# ================================================================
 
 @dataclass
-class MarketDataConfig:
-    symbols: List[str]
-    timeframe: str          # "1d" or "1h"
-    data_dir: str
-    default_start: str
-    default_end: str
+class DataEngine:
+    cfg: V10TRConfig
 
-
-# ---------------------------------------------------------------------------
-# MarketDataEngine
-# ---------------------------------------------------------------------------
-
-class MarketDataEngine:
-    def __init__(self, mdc: MarketDataConfig):
-        self.cfg = mdc
-        base = Path(mdc.data_dir)
-        self.base_dir = base
-        self.raw_dir = base / "raw"
-        self.processed_dir = base / "processed"
-
-        # ensure directories exist
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---------- helpers ----------
-
-    @staticmethod
-    def _parse_date(dt: Union[str, datetime]) -> datetime:
-        if isinstance(dt, datetime):
-            return dt
-        return datetime.fromisoformat(dt)
-
-    def _symbol_filename(self, symbol: str) -> str:
+    # ------------------------------------------------------------
+    #  PUBLIC METHOD: get_history(symbol) → OHLCV DataFrame
+    # ------------------------------------------------------------
+    def get_history(self, symbol: str) -> pd.DataFrame:
         """
-        Turn 'EURUSD=X' into a safe filename like 'EURUSD=X_1d.csv'
+        Returns a clean daily OHLCV DataFrame for the given symbol.
+
+        Columns: Open, High, Low, Close, Volume
+        Index: DatetimeIndex
         """
-        safe = symbol.replace("/", "_").replace("=", "_")
-        return f"{safe}_{self.cfg.timeframe}.csv"
 
-    # ---------- Yahoo download ----------
+        # 1) Try cache
+        cached = load_from_cache(symbol)
+        if cached is not None:
+            return cached
 
-    def _download_from_yfinance(
-        self,
-        symbol: str,
-        start_dt: datetime,
-        end_dt: datetime
-    ) -> pd.DataFrame:
-        """
-        Download from Yahoo Finance using the timeframe from our config.
+        # 2) Download from Yahoo with retries
+        df = self._download_from_yahoo(symbol)
 
-        For V10-Daily:
-            cfg.timeframe = "1d"  -> interval="1d"
-        If later we revert to intraday:
-            cfg.timeframe = "1h"  -> interval="60m"
-        """
-        interval = self.cfg.timeframe
-        if interval == "1h":
-            interval = "60m"  # yfinance intraday symbol
+        # 3) Clean & standardize
+        df = self._clean_dataframe(df)
 
-        df = yf.download(
-            symbol,
-            start=start_dt,
-            end=end_dt,
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-        )
+        # 4) Save to cache
+        save_to_cache(symbol, df)
 
-        if df is None or df.empty:
-            raise ValueError(f"No data for {symbol}")
+        return df
 
-        # normalize column names
-        df = df.rename(
-            columns={
-                "Open": "open",
-                "High": "high",
-                "Low": "low",
-                "Close": "close",
-                "Adj Close": "adj_close",
-                "Volume": "volume",
-            }
-        )
+    # ------------------------------------------------------------
+    #  INTERNAL: download via yfinance with basic retry
+    # ------------------------------------------------------------
+    def _download_from_yahoo(self, symbol: str) -> pd.DataFrame:
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    f"[DATA] Downloading {symbol} (attempt {attempt}/{max_retries})"
+                )
+                df = yf.download(
+                    symbol,
+                    start=self.cfg.start_date,
+                    end=self.cfg.end_date,
+                    interval=self.cfg.timeframe,
+                    auto_adjust=False,
+                    progress=False,
+                )
+                if df is not None and not df.empty:
+                    return df
+                else:
+                    logger.warning(f"[DATA] Empty data for {symbol} on attempt {attempt}")
+            except Exception as e:
+                logger.warning(f"[DATA] Error downloading {symbol}: {e}")
+            time.sleep(2.0)
 
-        # keep only what we need
-        cols = ["open", "high", "low", "close", "volume"]
-        df = df[cols]
-        df = df.dropna()
+        raise RuntimeError(f"[DATA] Failed to download data for {symbol} after retries")
 
-        # ensure datetime index and sort
-        df.index = pd.to_datetime(df.index)
+    # ------------------------------------------------------------
+    #  INTERNAL: standardize columns & clean
+    # ------------------------------------------------------------
+    def _clean_dataframe(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        df = df_raw.copy()
+
+        # Standardize column names
+        col_map = {
+            "Open": "Open",
+            "High": "High",
+            "Low": "Low",
+            "Close": "Close",
+            "Adj Close": "Close",   # prefer Close but fall back if needed
+            "Volume": "Volume",
+        }
+
+        # Only keep known columns
+        keep_cols = [c for c in df.columns if c in col_map]
+        df = df[keep_cols].rename(columns=col_map)
+
+        # If "Close" is missing but "Adj Close" exists
+        if "Close" not in df.columns and "Adj Close" in df_raw.columns:
+            df["Close"] = df_raw["Adj Close"]
+
+        # Ensure all required columns exist, fill missing with ffill
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in df.columns:
+                df[col] = df["Close"]
+        if "Volume" not in df.columns:
+            df["Volume"] = 0.0
+
+        # Drop rows without close price
+        df = df.dropna(subset=["Close"])
+
+        # Sort by date index
         df = df.sort_index()
 
         return df
 
-    # ---------- public API ----------
-
-    def get_history(
-        self,
-        symbol: str,
-        start: Optional[Union[str, datetime]] = None,
-        end: Optional[Union[str, datetime]] = None,
-        force_download: bool = False,
-    ) -> pd.DataFrame:
-        """
-        Main entry point used by main.py and the rest of V10.
-
-        - symbol: "EURUSD=X" etc.
-        - start/end: optional override of default dates
-        - force_download: if True, ignore cache and re-pull from Yahoo
-        """
-        if start is None:
-            start = self.cfg.default_start
-        if end is None:
-            end = self.cfg.default_end
-
-        start_dt = self._parse_date(start)
-        end_dt = self._parse_date(end)
-
-        # path for cached raw data
-        fname = self._symbol_filename(symbol)
-        fpath = self.raw_dir / fname
-
-        if fpath.exists() and not force_download:
-            df = pd.read_csv(fpath, parse_dates=["timestamp"])
-            df = df.set_index("timestamp")
-            df = df.sort_index()
-            return df
-
-        # download fresh
-        df = self._download_from_yfinance(symbol, start_dt, end_dt)
-
-        # cache to disk
-        tmp = df.copy()
-        tmp["timestamp"] = tmp.index
-        tmp.to_csv(fpath, index=False)
-
-        return df

@@ -1,132 +1,71 @@
-# main.py
-#
-# V10-Daily controller script.
-# Wires together:
-#   - MarketDataEngine  (data_engine.py)
-#   - FeatureEngine     (feature_engine.py)
-#   - RegimeEngine      (regime_engine.py)
-#   - LabelBuilder      (ml_models.py)
-#   - EnsembleSignalModel (ml_models.py)
-#   - StrategyEngine    (strategy.py)
-#   - RiskEngine        (risk_engine.py)
-#   - Backtester        (backtester.py)
-#
-# Runs a full backtest for each symbol listed in BotConfig.symbols.
+# ================================================================
+#  MAIN — V10-TR CCT-90
+#  Full system launcher for training + backtesting
+# ================================================================
 
-from __future__ import annotations
-
-import logging
-from typing import Dict
-
-from config import BotConfig
-from data_engine import MarketDataConfig, MarketDataEngine
-from feature_engine import FeatureEngine
-from regime_engine import RegimeEngine
-from ml_models import LabelBuilder, EnsembleSignalModel
-from strategy import StrategyEngine
-from risk_engine import RiskEngine
+from config import V10TRConfig
 from backtester import Backtester
+from utils import logger
+import json
+import numpy as np
+import os
 
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
+def save_results(results, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
+    # Save metrics
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump({
+            "final_equity": float(results["final_equity"]),
+            "total_return_pct": float(results["total_return_pct"]),
+            "win_rate": float(results["win_rate"]),
+            "num_trades": int(results["num_trades"]),
+        }, f, indent=4)
 
+    # Save equity curve
+    np.save(os.path.join(output_dir, "equity_curve.npy"),
+            results["equity_curve"])
 
-# ---------------------------------------------------------------------------
-# Single-symbol pipeline
-# ---------------------------------------------------------------------------
+    # Save trades log
+    trades_path = os.path.join(output_dir, "trades.json")
+    with open(trades_path, "w") as f:
+        json.dump(results["trades"], f, indent=4)
 
-def run_symbol(cfg: BotConfig, symbol: str) -> Dict:
-    logger.info(f"=== BACKTESTING {symbol} ===")
+    logger.info(f"[MAIN] Results saved to {output_dir}/")
 
-    # ----- DATA -----
-    mdc = MarketDataConfig(
-        symbols=[symbol],
-        timeframe=cfg.timeframe,
-        data_dir=cfg.data_dir,
-        default_start=cfg.start_date,
-        default_end=cfg.end_date,
-    )
-    data_engine = MarketDataEngine(mdc)
-    df = data_engine.get_history(symbol, start=cfg.start_date, end=cfg.end_date)
-
-    logger.info(f"Loaded {len(df)} bars for {symbol}")
-
-    # ----- FEATURES -----
-    fe = FeatureEngine()        # NOTE: new class name & no cfg arg
-    df = fe.build_features(df)
-
-    logger.info(f"After feature engineering: {len(df)} rows, {len(df.columns)} columns")
-
-    # ----- REGIME CLASSIFICATION -----
-    reg_engine = RegimeEngine(cfg)
-    df = reg_engine.classify_regime(df)
-
-    # ----- LABELS -----
-    label_builder = LabelBuilder(cfg)
-    df = label_builder.build_labels(df)
-
-    # Filter out rows without labels if your LabelBuilder uses 0 / NaN
-    if "label" not in df.columns:
-        raise ValueError("Label column 'label' not found after label building.")
-    df = df.dropna(subset=["label"])
-
-    logger.info(f"After labeling: {len(df)} rows remain")
-
-    # ----- MODEL TRAINING -----
-    model = EnsembleSignalModel(cfg)
-    report = model.train(df)
-    logger.info(f"Model training report for {symbol}: {report}")
-
-    # ----- STRATEGY & RISK ENGINES -----
-    strat_engine = StrategyEngine(cfg, model)
-    risk_engine = RiskEngine(cfg)
-
-    # ----- BACKTEST -----
-    backtester = Backtester(cfg, strat_engine, risk_engine)
-    stats = backtester.run(df, symbol)
-
-    logger.info(f"Backtest stats for {symbol}: {stats}")
-
-    return stats
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 def main():
-    cfg = BotConfig()
-    all_stats: Dict[str, Dict] = {}
+    logger.info("[MAIN] Starting V10-TR CCT-90 AI system...")
 
-    logger.info("Starting V10-Daily backtests...")
-    logger.info(
-        f"Symbols: {cfg.symbols}, timeframe={cfg.timeframe}, "
-        f"start={cfg.start_date}, end={cfg.end_date}"
-    )
+    # ------------------------------------------------------------
+    # LOAD CONFIG
+    # ------------------------------------------------------------
+    cfg = V10TRConfig()
 
-    for s in cfg.symbols:
-        try:
-            stats = run_symbol(cfg, s)
-            all_stats[s] = stats
-        except Exception as e:
-            logger.exception(f"Error while processing {s}: {e}")
+    # ------------------------------------------------------------
+    # RUN BACKTEST
+    # ------------------------------------------------------------
+    bt = Backtester(cfg, symbol=cfg.symbol)
+    results = bt.run()
 
-    logger.info("=== SUMMARY ===")
-    for sym, st in all_stats.items():
-        logger.info(
-            f"{sym}: final_equity={st.get('final_equity')}, "
-            f"ann_return={st.get('ann_return')}, "
-            f"sharpe={st.get('sharpe')}, "
-            f"max_drawdown={st.get('max_drawdown')}"
-        )
+    # ------------------------------------------------------------
+    # PRINT SUMMARY
+    # ------------------------------------------------------------
+    logger.info("====================================")
+    logger.info(f" FINAL EQUITY:     {results['final_equity']:.2f}")
+    logger.info(f" TOTAL RETURN:     {results['total_return_pct']:.2f}%")
+    logger.info(f" TRADES EXECUTED:  {results['num_trades']}")
+    logger.info(f" WIN RATE:         {results['win_rate']*100:.1f}%")
+    logger.info("====================================")
+
+    # ------------------------------------------------------------
+    # SAVE OUTPUT
+    # ------------------------------------------------------------
+    save_results(results)
+
+    logger.info("[MAIN] Completed V10-TR CCT-90.")
 
 
 if __name__ == "__main__":

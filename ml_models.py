@@ -1,137 +1,48 @@
 # ml_models.py
-#
-# V10-Daily ML module
-# Provides:
-#   - LabelBuilder
-#   - EnsembleSignalModel
-#
-# The model returns a continuous signal in [-1, +1].
-
-from __future__ import annotations
 import numpy as np
-import pandas as pd
 from dataclasses import dataclass
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import accuracy_score
-
-
-# ---------------------------------------------------------------------
-# Label Builder (for daily timeframe)
-# ---------------------------------------------------------------------
 
 @dataclass
-class LabelBuilder:
+class V10Ensemble:
     cfg: any
 
-    def build_labels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Creates a future return label (binary: up/down).
-        Prediction horizon: cfg.label_horizon_days.
-        """
-
-        horizon = getattr(self.cfg, "label_horizon_days", 3)
-
-        df = df.copy()
-        df["future_close"] = df["close"].shift(-horizon)
-        df["future_ret"] = (df["future_close"] - df["close"]) / df["close"]
-
-        df["label"] = np.where(df["future_ret"] > 0, 1, 0)
-
-        df = df.dropna(subset=["future_close", "future_ret", "label"])
-        return df
-
-
-# ---------------------------------------------------------------------
-# Ensemble Signal Model
-# Produces a *continuous* signal from 2 ML models
-# ---------------------------------------------------------------------
-
-class EnsembleSignalModel:
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-        # Two complementary learners
-        self.rf = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=6,
-            min_samples_split=20,
-            random_state=42
+    def __post_init__(self):
+        # Experts
+        self.exp_trend = GradientBoostingClassifier(
+            n_estimators=self.cfg.gb_n_estimators,
+            learning_rate=self.cfg.gb_learning_rate,
+            max_depth=self.cfg.gb_max_depth
+        )
+        self.exp_range = RandomForestClassifier(
+            n_estimators=self.cfg.rf_n_estimators,
+            max_depth=self.cfg.rf_max_depth
+        )
+        self.exp_shock = RandomForestClassifier(
+            n_estimators=self.cfg.rf_n_estimators,
+            max_depth=self.cfg.rf_max_depth
         )
 
-        self.gb = GradientBoostingClassifier(
-            n_estimators=300,
-            learning_rate=0.01,
-            max_depth=3,
-            random_state=42
-        )
+    def fit(self, X, y, regimes):
+        # split by regime
+        X_t, y_t = X[regimes==0], y[regimes==0]
+        X_r, y_r = X[regimes==1], y[regimes==1]
+        X_s, y_s = X[regimes==2], y[regimes==2]
 
-        self.features = None
-        self.fitted = False
+        if len(y_t)>10: self.exp_trend.fit(X_t, y_t)
+        if len(y_r)>10: self.exp_range.fit(X_r, y_r)
+        if len(y_s)>10: self.exp_shock.fit(X_s, y_s)
 
-    # -------------------------------------------------------------
-    # Train model
-    # -------------------------------------------------------------
+    def predict_proba(self, X, regime):
+        if regime==0: return self.exp_trend.predict_proba(X)[0]
+        if regime==1: return self.exp_range.predict_proba(X)[0]
+        return self.exp_shock.predict_proba(X)[0]
 
-    def train(self, df: pd.DataFrame):
+    def signal(self, X, regime):
+        proba = self.predict_proba(X, regime)
+        # class order: [-1,0,1]
+        cls = [-1,0,1]
+        p_neg = proba[cls.index(-1)]
+        p_pos = proba[cls.index(1)]
+        return p_pos - p_neg
 
-        # Identify usable columns
-        feature_cols = [c for c in df.columns
-                        if c not in ["open", "high", "low", "close",
-                                     "future_close", "future_ret", "label",
-                                     "regime"]]
-
-        self.features = feature_cols
-
-        X = df[feature_cols]
-        y = df["label"]
-
-        # Fit each model
-        self.rf.fit(X, y)
-        self.gb.fit(X, y)
-
-        self.fitted = True
-
-        # Score
-        pred = self.predict_proba_raw(X)
-        pred_class = (pred > 0.5).astype(int)
-        acc = accuracy_score(y, pred_class)
-
-        return {
-            "features_used": feature_cols,
-            "training_accuracy": acc,
-            "rows": len(df)
-        }
-
-    # -------------------------------------------------------------
-    # Internal: raw prob. prediction
-    # -------------------------------------------------------------
-
-    def predict_proba_raw(self, X: pd.DataFrame) -> np.ndarray:
-        """Returns probability of rising market from both models."""
-        prf = self.rf.predict_proba(X)[:, 1]
-        pgb = self.gb.predict_proba(X)[:, 1]
-        return (prf + pgb) / 2
-
-    # -------------------------------------------------------------
-    # Public signal output
-    # -------------------------------------------------------------
-
-    def predict_signal(self, df_row: pd.Series) -> float:
-        """
-        Returns continuous signal in range [-1, +1].
-
-        +1 → strong buy
-        -1 → strong sell
-         0 → neutral
-        """
-
-        if not self.fitted:
-            raise RuntimeError("Model not trained yet.")
-
-        X = df_row[self.features].values.reshape(1, -1)
-        proba = self.predict_proba_raw(pd.DataFrame([df_row[self.features]]))[0]
-
-        # Convert prob into signal
-        signal = (proba - 0.5) * 2
-        return float(signal)

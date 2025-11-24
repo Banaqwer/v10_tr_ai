@@ -1,83 +1,191 @@
-# backtester.py
+# ================================================================
+#  BACKTEST ENGINE — V10-TR CCT-90
+#  Full daily loop running the entire AI pipeline
+# ================================================================
 
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
-from execution import ExecutionSimulator
+
+from config import V10TRConfig
+from data_engine import DataEngine
+from feature_engine import FeatureEngine, FEATURE_COLS
+from label_engine import LabelEngine
+from regime_engine import RegimeEngine
+from embed_engine import CCT90Embedder
+from transformer_engine import TransformerEncoder
+from experts_engine import ExpertsEngine
+from strategy import Strategy
 from risk_engine import RiskEngine
-from strategy import StrategyEngine
+
+from utils import logger
 
 
+@dataclass
 class Backtester:
-    def __init__(self, cfg, strat, risk):
-        self.cfg = cfg
-        self.strat = strat
-        self.risk = risk
-        self.exec = ExecutionSimulator(cfg.spread_cost, cfg.slippage)
+    cfg: V10TRConfig
+    symbol: str = "GC=F"
 
-    def run(self, df, symbol):
-        equity = self.cfg.initial_equity
-        positions = []
-        curve = []
+    # ------------------------------------------------------------
+    #  RUN FULL BACKTEST
+    # ------------------------------------------------------------
+    def run(self):
+        logger.info(f"[BACKTEST] Starting backtest for {self.symbol}")
 
-        for t, r in df.iterrows():
-            price = r["close"]
+        # ----------------------------------
+        # Load data
+        # ----------------------------------
+        data_engine = DataEngine(self.cfg)
+        df_prices = data_engine.get_history(self.symbol)
+        if df_prices.empty:
+            raise RuntimeError("[BACKTEST] Price data is empty")
 
-            # update positions
-            new_positions = []
-            for p in positions:
-                pnl = (price - p.entry_price) * p.units
-                exit_flag = False
+        # ----------------------------------
+        # Build features
+        # ----------------------------------
+        feat_engine = FeatureEngine(self.cfg)
+        df_feat = feat_engine.build_features(df_prices)
 
-                if p.units > 0:
-                    if price <= p.sl or price >= p.tp:
-                        exit_flag = True
-                else:
-                    if price >= p.sl or price <= p.tp:
-                        exit_flag = True
+        # Labeling (used only for training experts)
+        label_engine = LabelEngine(self.cfg)
+        df_labeled = label_engine.build_labels(df_feat)
 
-                if exit_flag:
-                    equity += pnl
-                else:
-                    new_positions.append(p)
+        # Extract matrices
+        feature_matrix = feat_engine.get_feature_matrix(df_labeled)
+        label_vector = label_engine.get_label_vector(df_labeled)
 
-            positions = new_positions
+        # ----------------------------------
+        # Regime classification
+        # ----------------------------------
+        regime_engine = RegimeEngine(self.cfg)
+        regimes = regime_engine.get_regime_vector(df_labeled)
 
-            # compute current risk
-            risk_taken = 0
-            for p in positions:
-                if p.units > 0:
-                    risk_taken += max(0, (p.entry_price - p.sl) * abs(p.units))
-                else:
-                    risk_taken += max(0, (p.sl - p.entry_price) * abs(p.units))
-            risk_taken /= equity
+        # ----------------------------------
+        # Compute Transformer contexts
+        # ----------------------------------
+        embedder = CCT90Embedder(self.cfg, n_features=feature_matrix.shape[1])
+        transformer = TransformerEncoder(self.cfg)
 
-            # generate signal
-            sig = self.strat.generate_signal(r)
+        context_list = []
+        for i in range(len(feature_matrix)):
+            past_window = feature_matrix[: i + 1]  # all up to day i
+            emb = embedder.transform(past_window)   # [6, embed_dim]
+            ctx = transformer(emb)                  # [d_model]
+            context_list.append(ctx)
 
-            # open new trade?
-            if abs(sig) > 0.1 and risk_taken < self.cfg.max_total_risk:
-                units = self.risk.compute_units(equity, r, sig)
-                sl, tp = self.risk.compute_sl_tp(r, sig)
-                pos = self.exec.execute(symbol, units, price, sl, tp, str(t))
-                if pos:
-                    positions.append(pos)
+        context_matrix = np.vstack(context_list)
 
-            # mark-to-market equity
-            mtm = sum([(price - p.entry_price) * p.units for p in positions])
-            curve.append(equity + mtm)
+        # ----------------------------------
+        # Train the experts
+        # ----------------------------------
+        experts_engine = ExpertsEngine(self.cfg)
 
-        eq = pd.Series(curve, index=df.index, name="equity")
-        ret = eq.pct_change().fillna(0)
+        # Combine features + context
+        X_full = experts_engine.build_training_matrix(
+            feature_matrix,
+            context_matrix
+        )
+        y = label_vector
+        expert_regimes = regimes
 
-        ann_factor = 252
-        ann_return = (1 + ret.mean())**ann_factor - 1
-        ann_vol = ret.std() * np.sqrt(ann_factor)
-        sharpe = ann_return / (ann_vol + 1e-12)
+        experts_engine.fit(X_full, y, expert_regimes)
 
-        return {
-            "final_equity": eq.iloc[-1],
-            "ann_return": ann_return,
-            "ann_vol": ann_vol,
-            "sharpe": sharpe,
-            "equity_curve": eq
+        # ----------------------------------
+        # Strategy + Risk engines
+        # ----------------------------------
+        strategy = Strategy(self.cfg, experts_engine)
+        risk = RiskEngine(self.cfg)
+
+        # ----------------------------------
+        # Daily Backtest
+        # ----------------------------------
+        equity = risk.initial_equity
+        equity_curve = []
+        signals = []
+        trades = []
+
+        close = df_labeled["Close"].values
+        high = df_labeled["High"].values
+        low = df_labeled["Low"].values
+        atr = df_labeled["ATR"].values
+
+        d_model = self.cfg.transformer_model_dim
+
+        for i in range(len(df_labeled)):
+
+            # Build today's input vector
+            x_today = X_full[i]
+            reg_today = regimes[i]
+
+            signal = strategy.generate_signal(x_today, reg_today)
+            signals.append(signal)
+
+            if signal == 0:
+                # flat day
+                equity_curve.append(equity)
+                continue
+
+            # Enter position
+            entry_price = close[i]
+            position_size = risk.compute_position_size(equity, atr[i])
+
+            sl, tp = risk.compute_sl_tp(entry_price, atr[i])
+
+            exit_price, outcome = risk.check_exit(
+                sl=sl,
+                tp=tp,
+                day_open=entry_price,
+                day_high=high[i],
+                day_low=low[i],
+            )
+
+            new_equity = risk.update_equity(
+                equity=equity,
+                position=position_size,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                direction=signal,
+                outcome=outcome,
+            )
+
+            trade_pnl = new_equity - equity
+
+            trades.append({
+                "day": i,
+                "signal": signal,
+                "entry": entry_price,
+                "exit": exit_price,
+                "pnl": trade_pnl,
+                "equity_before": equity,
+                "equity_after": new_equity,
+                "regime": reg_today,
+            })
+
+            equity = new_equity
+            equity_curve.append(equity)
+
+        # ----------------------------------
+        # Build results
+        # ----------------------------------
+        results = {
+            "equity_curve": np.array(equity_curve),
+            "signals": np.array(signals),
+            "trades": trades,
+            "final_equity": equity,
+            "total_return_pct": (equity / risk.initial_equity - 1) * 100,
+            "num_trades": len(trades),
+            "win_rate": self._compute_win_rate(trades),
         }
+
+        logger.info(f"[BACKTEST] Finished. Final equity: {equity:.2f}")
+
+        return results
+
+    # ------------------------------------------------------------
+    #  INTERNAL: Compute win rate
+    # ------------------------------------------------------------
+    def _compute_win_rate(self, trades):
+        if len(trades) == 0:
+            return 0.0
+        wins = [t for t in trades if t["pnl"] > 0]
+        return len(wins) / len(trades)

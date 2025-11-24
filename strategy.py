@@ -1,75 +1,78 @@
-# strategy.py
-#
-# V10-Daily Strategy Engine
-# Uses a trained model (EnsembleSignalModel) to produce trading signals
-# and turn them into discrete long/short/flat positions.
-
-from __future__ import annotations
+# ================================================================
+#  STRATEGY ENGINE — V10-TR CCT-90
+#  Converts expert probabilities into trading signals
+# ================================================================
 
 from dataclasses import dataclass
 import numpy as np
-import pandas as pd
+
+from config import V10TRConfig
+from experts_engine import ExpertsEngine
+from utils import logger
 
 
 @dataclass
-class StrategyEngine:
-    cfg: any
-    model: any  # any object with predict_signal(df_row) -> float in [-1, 1]
+class Strategy:
+    """
+    Strategy wrapper around the ExpertsEngine.
 
-    # ---------------------------------------------------------
-    # Core signal computation (continuous in [-1, 1])
-    # ---------------------------------------------------------
-    def compute_signal(self, row: pd.Series) -> float:
-        """
-        Use the ML model to compute a continuous signal in [-1, +1].
-        """
-        signal = self.model.predict_signal(row)
-        return float(signal)
+    Responsibilities:
+      - For a given input row x_row (features + context) and regime,
+        query the experts for P(y = -1, 0, +1).
+      - Convert probabilities into a discrete signal:
+            +1  → go long
+             0  → stay flat
+            -1  → go short
 
-    # ---------------------------------------------------------
-    # Backtester API compatibility
-    # ---------------------------------------------------------
-    def generate_signal(self, row: pd.Series) -> float:
-        """
-        Wrapper expected by the Backtester.
-        Simply calls compute_signal(row).
-        """
-        return self.compute_signal(row)
+    Uses an "edge" metric:
+        edge = P(+1) - P(-1)
 
-    # ---------------------------------------------------------
-    # Map continuous signal to discrete position
-    # ---------------------------------------------------------
-    def to_position(self, signal: float) -> int:
-        """
-        Convert continuous signal to discrete position:
-          +1 = long
-          -1 = short
-           0 = flat
-        using cfg.min_signal_abs as threshold.
-        """
-        thr = getattr(self.cfg, "min_signal_abs", 0.25)
+    If edge > threshold_long → go long
+    If edge < -threshold_short → go short
+    Else → flat
+    """
 
-        if signal > thr:
-            return 1
-        elif signal < -thr:
+    cfg: V10TRConfig
+    experts: ExpertsEngine
+    threshold: float = 0.20   # conviction threshold for entering a trade
+
+    # ------------------------------------------------------------
+    #  CONVERT PROBABILITIES INTO A SIGNAL
+    # ------------------------------------------------------------
+    def signal_from_proba(self, proba: np.ndarray) -> int:
+        """
+        proba: numpy array [P(-1), P(0), P(+1)]
+        """
+        if proba.shape[0] != 3:
+            raise ValueError(f"[STRATEGY] Expected proba of length 3, got {len(proba)}")
+
+        p_neg, p_zero, p_pos = float(proba[0]), float(proba[1]), float(proba[2])
+
+        # Edge in favor of long vs short
+        edge = p_pos - p_neg
+
+        if edge > self.threshold:
+            return +1
+        elif edge < -self.threshold:
             return -1
         else:
             return 0
 
-    # ---------------------------------------------------------
-    # Vectorised position generation over a DataFrame
-    # ---------------------------------------------------------
-    def generate_positions(self, df: pd.DataFrame) -> pd.Series:
+    # ------------------------------------------------------------
+    #  PUBLIC: GENERATE SIGNAL FOR A SINGLE ROW
+    # ------------------------------------------------------------
+    def generate_signal(self, x_row: np.ndarray, regime: int) -> int:
         """
-        Apply the strategy over a DataFrame of features, returning
-        a Series of discrete positions indexed like df.
+        x_row: 1D numpy array representing combined features + context
+        regime: integer {0, 1, 2} from RegimeEngine
+
+        Returns: +1, 0, or -1
         """
-        positions = []
-        for idx, row in df.iterrows():
-            s = self.compute_signal(row)
-            pos = self.to_position(s)
-            positions.append(pos)
+        proba = self.experts.predict_proba(x_row, regime)
+        sig = self.signal_from_proba(proba)
 
-        positions = pd.Series(positions, index=df.index, name="position")
-        return positions
+        logger.debug(
+            f"[STRATEGY] regime={regime}, proba={proba}, signal={sig}"
+        )
 
+        return sig

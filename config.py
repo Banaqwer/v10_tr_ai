@@ -1,73 +1,174 @@
-# config.py (V10 – DAILY timeframe, high-win-rate focused)
-from dataclasses import dataclass, field
-from typing import List, Dict
+# ================================================================
+#  V10-TR CCT-90 CONFIGURATION FILE
+#  Full Transformer + Compressed Context + 5 Experts
+#  DAILY timeframe FX trading AI (Render-ready)
+# ================================================================
 
+from dataclasses import dataclass, field
+from datetime import datetime
+
+
+# ================================================================
+#  MARKET UNIVERSE
+# ================================================================
+
+UNIVERSE = [
+    "EURUSD=X",
+    "GBPUSD=X",
+    "USDJPY=X",
+    "AUDUSD=X",
+]
+
+
+# ================================================================
+#  TIMEFRAME & DATA RANGE
+# ================================================================
+
+TIMEFRAME = "1d"
+
+START_DATE = "2010-01-01"
+END_DATE = datetime.utcnow().strftime("%Y-%m-%d")
+
+
+# ================================================================
+#  TRAIN / TEST SPLITS (rolling window backtest)
+# ================================================================
+
+TRAIN_YEARS = 4
+TEST_YEARS = 1
+
+TRAIN_WINDOW_DAYS = TRAIN_YEARS * 252
+TEST_WINDOW_DAYS = TEST_YEARS * 252
+
+
+# ================================================================
+#  LABEL SETTINGS (TP/SL intraday simulation)
+# ================================================================
+
+FORWARD_HORIZON_DAYS = 10
+
+ATR_WINDOW = 14
+TP_ATR_MULT = 2.0
+SL_ATR_MULT = 1.0
+
+
+# ================================================================
+#  CCT-90 EMBEDDING SETTINGS
+# ================================================================
+
+CCT_WINDOW_DAYS = 90
+CCT_CHUNK_SIZE = 15                    # 90 days → 6 chunks
+CCT_EMBED_DIM = 32                    # embedding dimension per chunk
+
+
+# ================================================================
+#  TRANSFORMER SETTINGS (Render-safe CPU version)
+# ================================================================
+
+TRANSFORMER_LAYERS = 4
+TRANSFORMER_HEADS = 4
+TRANSFORMER_MODEL_DIM = 64           # dimension of transformer tokens
+TRANSFORMER_FEEDFORWARD_DIM = 128    # inner feed-forward layer
+TRANSFORMER_DROPOUT = 0.1
+
+
+# ================================================================
+#  REGIME SETTINGS
+# ================================================================
+
+N_REGIMES = 3   # Trend / Range / Shock
+
+
+# ================================================================
+#  EXPERT MODELS SETTINGS (5 experts)
+# ================================================================
+
+EXPERT_TYPES = [
+    "trend_continuation",
+    "trend_reversal",
+    "mean_reversion",
+    "volatility_breakout",
+    "shock",
+]
+
+RF_ESTIMATORS = 250
+RF_MAX_DEPTH = 6
+
+GB_ESTIMATORS = 200
+GB_LEARNING_RATE = 0.05
+GB_MAX_DEPTH = 3
+
+
+# ================================================================
+#  RISK SETTINGS
+# ================================================================
+
+INITIAL_EQUITY = 100_000.0
+
+RISK_PER_TRADE = 0.0075          # 0.75%
+MAX_RISK_PER_SYMBOL = 0.02       # 2%
+MAX_PORTFOLIO_RISK = 0.05        # 5%
+
+DAILY_MAX_DRAWDOWN = 0.02        # stop trading symbol for the day
+
+SLIPPAGE_PIPS = 0.2
+COMMISSION_PER_TRADE = 0.0
+
+
+# ================================================================
+#  LOGGING SETTINGS
+# ================================================================
+
+VERBOSE = True
+
+
+# ================================================================
+#  MASTER CONFIG OBJECT
+# ================================================================
 
 @dataclass
-class BotConfig:
-    # Instruments and timeframes
-    # Yahoo Finance ticker format for FX
-    symbols: List[str] = field(
-        default_factory=lambda: ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"]
-    )
+class V10TRConfig:
+    universe: list = field(default_factory=lambda: UNIVERSE)
 
-    # DAILY timeframe for V10-1D
-    timeframe: str = "1d"   # used as yfinance "interval"
+    timeframe: str = TIMEFRAME
+    start_date: str = START_DATE
+    end_date: str = END_DATE
 
-    # Backtest window – multi-year but reasonable
-    start_date: str = "2015-01-01"
-    end_date: str = "2024-12-31"
+    train_window_days: int = TRAIN_WINDOW_DAYS
+    test_window_days: int = TEST_WINDOW_DAYS
 
-    # Data paths
-    data_dir: str = "data"
-    raw_subdir: str = "raw"
-    processed_subdir: str = "processed"
+    forward_horizon_days: int = FORWARD_HORIZON_DAYS
+    atr_window: int = ATR_WINDOW
+    tp_atr_mult: float = TP_ATR_MULT
+    sl_atr_mult: float = SL_ATR_MULT
 
-    # Capital & risk – keep conservative
-    initial_equity: float = 100000.0
-    risk_per_trade: float = 0.005        # 0.5% of equity per trade
-    max_total_risk: float = 0.03         # 3% total open risk
-    max_drawdown_stop: float = 0.20      # Stop opening NEW trades if DD > 20%
+    cct_window_days: int = CCT_WINDOW_DAYS
+    cct_chunk_size: int = CCT_CHUNK_SIZE
+    cct_embed_dim: int = CCT_EMBED_DIM
 
-    # Feature params (these are in DAYS now)
-    ma_windows: List[int] = field(default_factory=lambda: [10, 20, 50, 100, 200])
-    atr_window: int = 14
-    rsi_window: int = 14
-    bb_window: int = 20
-    bb_std: float = 2.0
+    transformer_layers: int = TRANSFORMER_LAYERS
+    transformer_heads: int = TRANSFORMER_HEADS
+    transformer_model_dim: int = TRANSFORMER_MODEL_DIM
+    transformer_feedforward_dim: int = TRANSFORMER_FEEDFORWARD_DIM
+    transformer_dropout: float = TRANSFORMER_DROPOUT
 
-    # Breakout params (daily Donchian channels)
-    breakout_lookbacks: List[int] = field(default_factory=lambda: [20, 55])
+    n_regimes: int = N_REGIMES
+    expert_types: list = field(default_factory=lambda: EXPERT_TYPES)
 
-    # Regime thresholds (trend & vol)
-    trend_z_threshold: float = 0.5
-    vol_z_high: float = 0.7
-    vol_z_low: float = -0.7
+    rf_estimators: int = RF_ESTIMATORS
+    rf_max_depth: int = RF_MAX_DEPTH
 
-    # Labeling / ML – DAILY horizon
-    horizon_bars: int = 3          # predict ~3 days ahead
-    label_threshold: float = 0.003 # 0.3% (~30 pips on EURUSD)
+    gb_estimators: int = GB_ESTIMATORS
+    gb_learning_rate: float = GB_LEARNING_RATE
+    gb_max_depth: int = GB_MAX_DEPTH
 
-    # ML model base params
-    ml_model_params_rf: Dict = field(default_factory=lambda: {
-        "n_estimators": 300,
-        "max_depth": 6,
-        "min_samples_leaf": 50,
-        "random_state": 42,
-        "n_jobs": -1
-    })
-    ml_model_params_gb: Dict = field(default_factory=lambda: {
-        "n_estimators": 200,
-        "max_depth": 3,
-        "learning_rate": 0.05,
-        "random_state": 42
-    })
+    initial_equity: float = INITIAL_EQUITY
+    risk_per_trade: float = RISK_PER_TRADE
+    max_risk_per_symbol: float = MAX_RISK_PER_SYMBOL
+    max_portfolio_risk: float = MAX_PORTFOLIO_RISK
+    daily_max_drawdown: float = DAILY_MAX_DRAWDOWN
 
-    # High-confidence filters (V10)
-    ml_edge_threshold: float = 0.20   # |p_up - p_down| must exceed this
-    min_confluence_score: float = 1.0 # sum of trend/breakout/mean-rev signs
-    min_signal_abs: float = 0.25      # combined signal must be at least this
+    slippage_pips: float = SLIPPAGE_PIPS
+    commission_per_trade: float = COMMISSION_PER_TRADE
 
-    # Transaction costs (still realistic for FX majors)
-    spread_cost: float = 0.0001
-    slippage: float = 0.00005
+    verbose: bool = VERBOSE
