@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+import torch  # <-- needed for _to_numpy
 
 from config import V10TRConfig
 from data_engine import DataEngine
@@ -19,6 +20,21 @@ from strategy import Strategy
 from risk_engine import RiskEngine
 
 from utils import logger
+
+
+# ------------------------------------------------------------
+# SAFE CONVERSION — FIX FOR TENSOR->NUMPY ISSUE
+# ------------------------------------------------------------
+def _to_numpy(x):
+    """
+    Safely convert tensors to NumPy arrays.
+
+    If x is a torch.Tensor that requires grad, detach and move to CPU
+    before calling .numpy(). For non-tensors, fall back to np.asarray.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
 @dataclass
@@ -69,11 +85,12 @@ class Backtester:
         context_list = []
         for i in range(len(feature_matrix)):
             past_window = feature_matrix[: i + 1]  # all up to day i
-            emb = embedder.transform(past_window)   # [6, embed_dim]
-            ctx = transformer(emb)                  # [d_model]
+            emb = embedder.transform(past_window)   # [6, embed_dim], torch tensor
+            ctx = transformer(emb)                  # [d_model], torch tensor
             context_list.append(ctx)
 
-        context_matrix = np.vstack(context_list)
+        # 🔥 CRUCIAL FIX: detach tensors before stacking with NumPy
+        context_matrix = np.vstack([_to_numpy(c) for c in context_list])
 
         # ----------------------------------
         # Train the experts
@@ -108,8 +125,6 @@ class Backtester:
         high = df_labeled["High"].values
         low = df_labeled["Low"].values
         atr = df_labeled["ATR"].values
-
-        d_model = self.cfg.transformer_model_dim
 
         for i in range(len(df_labeled)):
 
