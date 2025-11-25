@@ -39,7 +39,6 @@ def _oanda_base_url() -> str:
 def _granularity_from_timeframe(tf: str) -> str:
     """
     Map our config timeframe to OANDA candle granularity.
-    Feel free to adjust if you change your config.
     """
     tf = tf.upper()
     mapping = {
@@ -87,7 +86,8 @@ class DataEngine:
             f"symbol={self.symbol}, timeframe={self.timeframe}"
         )
 
-    # ------------------------------------------------------------------    # Public API used by Backtester
+    # ------------------------------------------------------------------
+    # Public API used by Backtester
     # ------------------------------------------------------------------
     def get_history(self, symbol: Optional[str] = None) -> pd.DataFrame:
         """
@@ -103,7 +103,8 @@ class DataEngine:
         log.info(f"[DATA] Loaded {len(df)} bars for {inst}")
         return df
 
-    # ------------------------------------------------------------------    # OANDA download logic
+    # ------------------------------------------------------------------
+    # OANDA download logic
     # ------------------------------------------------------------------
     def _download_from_oanda(self, instrument: str) -> pd.DataFrame:
         """
@@ -111,13 +112,43 @@ class DataEngine:
         (inclusive) from OANDA, chunking if necessary.
         """
 
+        # --- DATE HANDLING: clamp end date so 'to' is never in the future ---
         # Expect ISO dates like "2015-01-01" in cfg; fallback if absent.
-        start_date = datetime.fromisoformat(getattr(self.cfg, "start_date", "2015-01-01")).replace(
-            tzinfo=timezone.utc
+        cfg_start_str = getattr(self.cfg, "start_date", "2015-01-01")
+        cfg_end_str = getattr(
+            self.cfg,
+            "end_date",
+            datetime.utcnow().strftime("%Y-%m-%d"),
         )
-        end_date = datetime.fromisoformat(getattr(self.cfg, "end_date", datetime.utcnow().strftime("%Y-%m-%d"))).replace(
-            tzinfo=timezone.utc
-        ) + timedelta(days=1)  # include last day
+
+        # Parse as dates (no time yet)
+        cfg_start_date = datetime.fromisoformat(cfg_start_str).date()
+        cfg_end_date = datetime.fromisoformat(cfg_end_str).date()
+
+        # OANDA doesn't allow 'to' timestamps in the future.
+        # So we clamp the effective end date to yesterday (UTC).
+        today_utc = datetime.now(timezone.utc).date()
+        max_allowed_end = today_utc - timedelta(days=1)
+        effective_end_date = min(cfg_end_date, max_allowed_end)
+
+        # If user accidentally set everything in the future, force a small window.
+        if effective_end_date < cfg_start_date:
+            log.warning(
+                "[DATA] Config end_date is in the future; "
+                "clamping to recent history window."
+            )
+            cfg_start_date = effective_end_date - timedelta(days=365)
+
+        # Build start/end datetimes in UTC.
+        start_date = datetime(
+            cfg_start_date.year, cfg_start_date.month, cfg_start_date.day,
+            tzinfo=timezone.utc,
+        )
+        # 'to' will be exclusive; add 1 day to include full last day but still <= now.
+        end_date = datetime(
+            effective_end_date.year, effective_end_date.month, effective_end_date.day,
+            tzinfo=timezone.utc,
+        ) + timedelta(days=1)
 
         granularity = _granularity_from_timeframe(self.timeframe)
 
@@ -133,7 +164,8 @@ class DataEngine:
 
         log.info(
             f"[DATA] OANDA candles | instrument={instrument}, "
-            f"granularity={granularity}, start={start_date.date()}, end={end_date.date()}"
+            f"granularity={granularity}, start={start_date.date()}, "
+            f"end={effective_end_date}"
         )
 
         # OANDA limit is 5000 candles / request. We chunk by time.
@@ -209,7 +241,8 @@ class DataEngine:
         df.sort_index(inplace=True)
         return df
 
-    # ------------------------------------------------------------------    # Cleaning
+    # ------------------------------------------------------------------
+    # Cleaning
     # ------------------------------------------------------------------
     def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
