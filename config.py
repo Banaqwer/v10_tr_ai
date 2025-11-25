@@ -162,3 +162,7 @@ class V10TRConfig:
     commission_per_trade: float = COMMISSION_PER_TRADE
 
     verbose: bool = VERBOSE
+
+    # 🔥 NEW: alias used by RiskEngine (risk per trade)
+    position_risk: float = RISK_PER_TRADE
+
