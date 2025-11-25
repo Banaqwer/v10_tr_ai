@@ -1,271 +1,324 @@
-# data_engine.py
+from __future__ import annotations
+
 import os
-import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import requests
+import yfinance as yf
 
-from utils import logger as _logger
-
-
-log = _logger.get_logger("DATA") if hasattr(_logger, "get_logger") else _logger
+from utils import logger
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-
-def _get_env(name: str, default: Optional[str] = None) -> str:
-    value = os.getenv(name, default)
-    if value is None:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+ISO_DATE_FMT = "%Y-%m-%d"
 
 
-def _oanda_base_url() -> str:
+def _parse_cfg_date(value: Optional[str], default: Optional[datetime] = None) -> datetime:
     """
-    Choose the correct OANDA API host based on OANDA_ENV / OANDA_DOMAIN.
-    practice -> api-fxpractice.oanda.com
-    live     -> api-fxtrade.oanda.com
+    Parse a YYYY-MM-DD date coming from the config. Assume UTC.
     """
-    env = (os.getenv("OANDA_ENV") or os.getenv("OANDA_DOMAIN") or "practice").lower()
-    if env == "live":
-        return "https://api-fxtrade.oanda.com/v3"
-    return "https://api-fxpractice.oanda.com/v3"
+    if value:
+        # Allow both "YYYY-MM-DD" and full ISO with time
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            dt = datetime.strptime(value, ISO_DATE_FMT)
+    elif default is not None:
+        dt = default
+    else:
+        raise ValueError("No date value supplied and no default provided")
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
-def _granularity_from_timeframe(tf: str) -> str:
-    """
-    Map our config timeframe to OANDA candle granularity.
-    """
-    tf = tf.upper()
-    mapping = {
-        "M1": "M1",
-        "M5": "M5",
-        "M15": "M15",
-        "M30": "M30",
-        "H1": "H1",
-        "H4": "H4",
-        "D": "D",
-        "1D": "D",
-    }
-    if tf not in mapping:
-        raise ValueError(f"Unsupported timeframe for OANDA: {tf}")
-    return mapping[tf]
+@dataclass
+class EngineDates:
+    start: datetime
+    end: datetime
 
-
-# ------------------------------------------------------------
-# DataEngine – OANDA version
-# ------------------------------------------------------------
 
 class DataEngine:
     """
-    V10-TR data engine that pulls candles directly from OANDA.
+    Unified data engine for V10-TR.
 
-    - No Yahoo Finance.
-    - Returns a DataFrame with index = datetime and columns:
-      [Open, High, Low, Close, Volume]
+    - In Yahoo! mode it pulls bars from yfinance.
+    - In OANDA mode it uses the REST v3 candles endpoint.
+
+    Expected usage from the rest of the code:
+
+        engine = DataEngine(cfg)
+        df = engine.get_history("EUR_USD")
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
-        self.symbol = cfg.symbol        # OANDA instrument, e.g. "EUR_USD", "XAU_USD"
-        self.timeframe = cfg.timeframe  # e.g. "D", "H1", "M5"
-        self.max_retries = getattr(cfg, "data_max_retries", 3)
-        self.retry_delay = getattr(cfg, "data_retry_delay", 2.0)
 
-        self._session = requests.Session()
-        self._base_url = _oanda_base_url()
-        self._token = _get_env("OANDA_TOKEN")
-        self._account_id = _get_env("OANDA_ACCOUNT_ID")
+        # ------------------------------------------------------------------
+        # Basic config
+        # ------------------------------------------------------------------
+        # default to OANDA now
+        self.source = getattr(cfg, "data_source", "oanda").lower()
+        self.timeframe = getattr(cfg, "timeframe", "D")
 
-        log.info(
-            f"[DATA] Using OANDA data source | env={os.getenv('OANDA_ENV', 'practice')}, "
-            f"symbol={self.symbol}, timeframe={self.timeframe}"
-        )
+        cfg_start = getattr(cfg, "start_date", "2010-01-01")
+        cfg_end = getattr(cfg, "end_date", None)
 
-    # ------------------------------------------------------------------
-    # Public API used by Backtester
-    # ------------------------------------------------------------------
-    def get_history(self, symbol: Optional[str] = None) -> pd.DataFrame:
-        """
-        Fetch historical candles for the given symbol (or cfg.symbol if None),
-        clean them, and return OHLCV DataFrame.
-        """
-        inst = symbol or self.symbol
-        log.info(f"[DATA] Requesting OANDA history for {inst}")
+        start = _parse_cfg_date(cfg_start)
 
-        raw_df = self._download_from_oanda(inst)
-        df = self._clean_dataframe(raw_df)
+        now = datetime.now(timezone.utc)
+        end = _parse_cfg_date(cfg_end, default=now) if cfg_end else now
 
-        log.info(f"[DATA] Loaded {len(df)} bars for {inst}")
-        return df
-
-    # ------------------------------------------------------------------
-    # OANDA download logic
-    # ------------------------------------------------------------------
-    def _download_from_oanda(self, instrument: str) -> pd.DataFrame:
-        """
-        Download all candles between cfg.start_date and cfg.end_date
-        (inclusive) from OANDA, chunking if necessary.
-        """
-
-        # --- DATE HANDLING: clamp end date so 'to' is never in the future ---
-        # Expect ISO dates like "2015-01-01" in cfg; fallback if absent.
-        cfg_start_str = getattr(self.cfg, "start_date", "2015-01-01")
-        cfg_end_str = getattr(
-            self.cfg,
-            "end_date",
-            datetime.utcnow().strftime("%Y-%m-%d"),
-        )
-
-        # Parse as dates (no time yet)
-        cfg_start_date = datetime.fromisoformat(cfg_start_str).date()
-        cfg_end_date = datetime.fromisoformat(cfg_end_str).date()
-
-        # OANDA doesn't allow 'to' timestamps in the future.
-        # So we clamp the effective end date to yesterday (UTC).
-        today_utc = datetime.now(timezone.utc).date()
-        max_allowed_end = today_utc - timedelta(days=1)
-        effective_end_date = min(cfg_end_date, max_allowed_end)
-
-        # If user accidentally set everything in the future, force a small window.
-        if effective_end_date < cfg_start_date:
-            log.warning(
-                "[DATA] Config end_date is in the future; "
-                "clamping to recent history window."
+        # OANDA rejects "to" dates in the future, so always clamp.
+        if end > now:
+            logger.warning(
+                "[DATA] Requested end_date %s is in the future – clamping to now (%s)",
+                end.isoformat(), now.isoformat()
             )
-            cfg_start_date = effective_end_date - timedelta(days=365)
+            end = now
 
-        # Build start/end datetimes in UTC.
-        start_date = datetime(
-            cfg_start_date.year, cfg_start_date.month, cfg_start_date.day,
-            tzinfo=timezone.utc,
+        self.dates = EngineDates(start=start, end=end)
+
+        # ------------------------------------------------------------------
+        # OANDA configuration (from environment variables)
+        # ------------------------------------------------------------------
+        self.oanda_env = os.environ.get("OANDA_ENV", "practice")
+        self.oanda_domain = os.environ.get("OANDA_DOMAIN", "practice")
+        self.oanda_account = os.environ.get("OANDA_ACCOUNT_ID")
+        self.oanda_token = os.environ.get("OANDA_TOKEN")
+
+        if self.source == "oanda":
+            if not self.oanda_token:
+                raise RuntimeError(
+                    "OANDA_TOKEN environment variable is not set – "
+                    "cannot use OANDA as data source."
+                )
+
+        self.session = requests.Session()
+        if self.oanda_token:
+            self.session.headers.update(
+                {
+                    "Authorization": f"Bearer {self.oanda_token}",
+                    "Content-Type": "application/json",
+                }
+            )
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+    def get_history(self, symbol: str) -> pd.DataFrame:
+        """
+        Fetch OHLCV history for the given symbol between engine.dates.start and
+        engine.dates.end (inclusive where possible).
+        """
+        if self.source == "oanda":
+            return self._get_history_oanda(symbol)
+        else:
+            return self._get_history_yahoo(symbol)
+
+    # ------------------------------------------------------------------ #
+    # Yahoo! Finance (kept as fallback)
+    # ------------------------------------------------------------------ #
+    def _get_history_yahoo(self, symbol: str) -> pd.DataFrame:
+        logger.info(
+            "[DATA] Using Yahoo! Finance data source | symbol=%s, timeframe=%s",
+            symbol, self.timeframe
         )
-        # 'to' will be exclusive; add 1 day to include full last day but still <= now.
-        end_date = datetime(
-            effective_end_date.year, effective_end_date.month, effective_end_date.day,
-            tzinfo=timezone.utc,
-        ) + timedelta(days=1)
+        start_str = self.dates.start.strftime(ISO_DATE_FMT)
+        end_str = self.dates.end.strftime(ISO_DATE_FMT)
 
-        granularity = _granularity_from_timeframe(self.timeframe)
-
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-        }
-
-        url = f"{self._base_url}/instruments/{instrument}/candles"
-
-        all_rows: List[dict] = []
-        since = start_date
-
-        log.info(
-            f"[DATA] OANDA candles | instrument={instrument}, "
-            f"granularity={granularity}, start={start_date.date()}, "
-            f"end={effective_end_date}"
+        data = yf.download(
+            symbol,
+            start=start_str,
+            end=end_str,
+            interval=self._map_timeframe_to_yf(self.timeframe),
+            auto_adjust=False,
+            progress=False,
         )
 
-        # OANDA limit is 5000 candles / request. We chunk by time.
-        while since < end_date:
+        if data.empty:
+            raise RuntimeError(f"No Yahoo data returned for {symbol}")
+
+        data.index = pd.to_datetime(data.index, utc=True)
+        return data[["Open", "High", "Low", "Close", "Volume"]].sort_index()
+
+    # ------------------------------------------------------------------ #
+    # OANDA helpers
+    # ------------------------------------------------------------------ #
+    def _get_history_oanda(self, symbol: str) -> pd.DataFrame:
+        env = self.oanda_env
+        granularity = self._map_timeframe_to_oanda(self.timeframe)
+
+        # Your config already uses EUR_USD / XAU_USD style, so no transform.
+        instrument = symbol
+
+        logger.info(
+            "[DATA] Using OANDA data source | env=%s, symbol=%s, timeframe=%s",
+            env, instrument, granularity,
+        )
+
+        domain = "api-fxpractice.oanda.com" if env == "practice" else "api-fxtrade.oanda.com"
+        base_url = f"https://{domain}/v3/instruments/{instrument}/candles"
+
+        start = self.dates.start
+        end = self.dates.end
+
+        logger.info(
+            "[DATA] Requesting OANDA history for %s | granularity=%s, "
+            "start=%s, end=%s",
+            instrument, granularity, start.date(), end.date(),
+        )
+
+        candles: List[Dict[str, Any]] = []
+
+        # Work *backwards* from end to start using `to` + `count` only.
+        # This avoids the forbidden combination `from + to + count`.
+        step = self._granularity_to_timedelta(granularity)
+        max_count = 5000
+        to_time = end
+
+        while True:
             params = {
-                "from": since.isoformat().replace("+00:00", "Z"),
-                "to": end_date.isoformat().replace("+00:00", "Z"),
                 "granularity": granularity,
-                "price": "M",  # mid prices
-                "count": 5000,
+                "price": "M",
+                "to": to_time.isoformat().replace("+00:00", "Z"),
+                "count": max_count,
             }
 
-            for attempt in range(1, self.max_retries + 1):
-                resp = self._session.get(url, headers=headers, params=params, timeout=30)
-                if resp.status_code == 429:
-                    log.warning("[DATA] OANDA rate limit. Sleeping before retry...")
-                    import time as _time
-                    _time.sleep(self.retry_delay * attempt)
-                    continue
-                if not resp.ok:
-                    log.warning(
-                        f"[DATA] OANDA request failed (status={resp.status_code}) "
-                        f"attempt {attempt}/{self.max_retries}: {resp.text[:200]}"
-                    )
-                    if attempt == self.max_retries:
-                        resp.raise_for_status()
-                    import time as _time
-                    _time.sleep(self.retry_delay * attempt)
-                    continue
+            attempt = 1
+            while True:
+                resp = self.session.get(base_url, params=params, timeout=30)
 
-                data = resp.json()
-                candles = data.get("candles", [])
-                if not candles:
-                    log.warning("[DATA] OANDA returned 0 candles for this chunk.")
-                    return pd.DataFrame()  # let cleaner handle KeyError if empty
+                if resp.ok:
+                    break
 
-                all_rows.extend(candles)
-                last_time_str = candles[-1]["time"]
-                last_dt = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
+                msg = resp.text
+                logger.warning(
+                    "[DATA] OANDA request failed (status=%s) attempt %d/3: %s",
+                    resp.status_code, attempt, msg,
+                )
+                # If after 3 tries it's still failing, let it crash and show the message.
+                if attempt >= 3:
+                    resp.raise_for_status()
+                attempt += 1
 
-                # Move cursor forward by one candle to avoid duplicates
-                since = last_dt + timedelta(seconds=1)
-                break  # success, exit retry loop
+            payload = resp.json()
+            batch = payload.get("candles", [])
+            if not batch:
+                break
 
-        if not all_rows:
-            return pd.DataFrame()
+            candles.extend(batch)
 
-        # Build DataFrame
+            # Oldest candle in this batch
+            first_time = self._parse_oanda_time(batch[0]["time"])
+
+            # Stop if we have reached or gone before the requested start,
+            # or if OANDA returned fewer than max_count candles (no more data).
+            if first_time <= start or len(batch) < max_count:
+                break
+
+            # Move the window backwards one step.
+            to_time = first_time - step
+
+        if not candles:
+            raise RuntimeError(f"No OANDA candles returned for {instrument}")
+
+        # Convert candles to a clean OHLCV DataFrame.
         records = []
-        for c in all_rows:
-            if not c.get("complete", True):
+        for c in candles:
+            if not c.get("complete", False):
                 continue
-            t = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
-            mid = c.get("mid") or c.get("ask") or c.get("bid")
-            if mid is None:
+
+            t = self._parse_oanda_time(c["time"])
+            if t < start or t > end:
                 continue
+
+            mid = c["mid"]
             records.append(
                 {
-                    "Datetime": t,
+                    "Date": t,
                     "Open": float(mid["o"]),
                     "High": float(mid["h"]),
                     "Low": float(mid["l"]),
                     "Close": float(mid["c"]),
-                    "Volume": int(c.get("volume", 0)),
+                    "Volume": int(c["volume"]),
                 }
             )
 
-        df = pd.DataFrame.from_records(records)
-        if df.empty:
-            return df
+        if not records:
+            raise RuntimeError(f"OANDA candles empty after filtering for {instrument}")
 
-        df.set_index("Datetime", inplace=True)
-        df.sort_index(inplace=True)
-        return df
+        df = pd.DataFrame.from_records(records).set_index("Date")
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = df.sort_index()
 
-    # ------------------------------------------------------------------
-    # Cleaning
-    # ------------------------------------------------------------------
-    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        logger.info(
+            "[DATA] OANDA history loaded | rows=%d, first=%s, last=%s",
+            len(df), df.index[0].isoformat(), df.index[-1].isoformat(),
+        )
+
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+
+    # ------------------------------------------------------------------ #
+    # Misc helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _map_timeframe_to_yf(tf: str) -> str:
+        tf = tf.upper()
+        if tf == "D":
+            return "1d"
+        if tf in ("H1", "1H"):
+            return "60m"
+        if tf in ("M5", "5M"):
+            return "5m"
+        return "1d"
+
+    @staticmethod
+    def _map_timeframe_to_oanda(tf: str) -> str:
+        tf = tf.upper()
+        if tf in ("D", "1D"):
+            return "D"
+        if tf in ("H1", "1H"):
+            return "H1"
+        if tf in ("M5", "5M"):
+            return "M5"
+        # If it's something else, just pass it through and let OANDA complain.
+        return tf
+
+    @staticmethod
+    def _granularity_to_timedelta(granularity: str) -> timedelta:
+        g = granularity.upper()
+        if g == "D":
+            return timedelta(days=1)
+        if g.startswith("H"):
+            hours = int(g[1:]) if len(g) > 1 else 1
+            return timedelta(hours=hours)
+        if g.startswith("M"):
+            minutes = int(g[1:]) if len(g) > 1 else 1
+            return timedelta(minutes=minutes)
+        return timedelta(days=1)
+
+    @staticmethod
+    def _parse_oanda_time(ts: str) -> datetime:
         """
-        Standardize columns & drop bad rows so the rest of the AI
-        (features, regime engine, etc.) can stay unchanged.
+        Parse OANDA's RFC3339 timestamps to aware UTC datetimes.
+        Examples:
+        - "2017-02-10T22:24:06.000000000Z"
+        - "2017-02-10T22:24:06Z"
         """
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        # strip nanoseconds beyond microsecond precision
+        if "." in ts:
+            date_part, frac_part = ts.split(".")
+            if "+" in frac_part:
+                frac, tz = frac_part.split("+", 1)
+                frac = frac[:6]  # microseconds
+                ts = f"{date_part}.{frac}+{tz}"
+        return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
-        if df.empty:
-            raise KeyError(
-                "Received empty dataframe from OANDA. "
-                "Check symbol, timeframe, and date range."
-            )
-
-        # Ensure required columns exist
-        for col in ["Open", "High", "Low", "Close"]:
-            if col not in df.columns:
-                raise KeyError(f"Expected column '{col}' in price data, got {df.columns.tolist()}")
-
-        # Drop rows with missing close
-        df = df.dropna(subset=["Close"])
-
-        # Optional: keep only OHLCV
-        keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        df = df[keep_cols]
-
-        return df
