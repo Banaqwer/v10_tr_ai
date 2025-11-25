@@ -53,16 +53,31 @@ def get_device():
 # ================================================================
 
 def compute_atr(df, window=14):
+    """
+    Compute Average True Range on a OHLC dataframe.
+
+    df must contain columns: 'High', 'Low', 'Close'.
+    Returns a pandas Series indexed like df.
+    """
     high = df["High"]
     low = df["Low"]
-    close = df["Close"].shift(1)
+    prev_close = df["Close"].shift(1)
 
-    tr1 = high - low
-    tr2 = (high - close).abs()
-    tr3 = (low - close).abs()
+    # True Range components as pandas Series
+    tr_components = pd.concat(
+        [
+            (high - low),             # high-low
+            (high - prev_close).abs(),  # |high - previous close|
+            (low - prev_close).abs(),   # |low - previous close|
+        ],
+        axis=1,
+    )
 
-    tr = np.maximum.reduce([tr1, tr2, tr3])
-    atr = tr.rolling(window).mean()
+    # Row-wise max -> still a pandas Series
+    tr = tr_components.max(axis=1)
+
+    # Rolling ATR; min_periods=1 so early rows don't become all NaN
+    atr = tr.rolling(window=window, min_periods=1).mean()
     return atr
 
 
@@ -167,4 +182,3 @@ def sliding_indices(total_len, window_size, step_size=1):
         end = start + window_size
         indices.append((start, end))
     return indices
-
