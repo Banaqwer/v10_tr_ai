@@ -1,404 +1,229 @@
 """
-Pydantic-based configuration loader with support for environment variables and YAML files.
-Provides a complete, production-ready settings management system.
+Configuration loader using Pydantic BaseSettings.
+Supports loading configuration from environment variables and YAML files.
 """
 
 import os
-import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
-from enum import Enum
+from typing import Any, Dict, Optional
 
 import yaml
-from pydantic import BaseSettings, Field, validator, SecretStr
-from pydantic.env_settings import SettingsSourceCallable
-from dotenv import load_dotenv
-
-
-# Configure logging
-logger = logging.getLogger(__name__)
-
-
-class EnvironmentEnum(str, Enum):
-    """Supported environment types."""
-    DEVELOPMENT = "development"
-    STAGING = "staging"
-    PRODUCTION = "production"
-    TESTING = "testing"
-
-
-class DatabaseConfig(BaseSettings):
-    """Database configuration."""
-    host: str = Field("localhost", description="Database host")
-    port: int = Field(5432, description="Database port")
-    username: str = Field("admin", description="Database username")
-    password: SecretStr = Field(default="", description="Database password")
-    database: str = Field("v10_tr_ai", description="Database name")
-    driver: str = Field("postgresql", description="Database driver")
-    pool_size: int = Field(10, description="Connection pool size")
-    max_overflow: int = Field(20, description="Maximum overflow connections")
-    
-    @property
-    def url(self) -> str:
-        """Generate database connection URL."""
-        password = self.password.get_secret_value() if self.password else ""
-        if password:
-            return f"{self.driver}://{self.username}:{password}@{self.host}:{self.port}/{self.database}"
-        return f"{self.driver}://{self.host}:{self.port}/{self.database}"
-    
-    class Config:
-        env_prefix = "DB_"
-        env_file = ".env"
-        case_sensitive = False
-
-
-class RedisConfig(BaseSettings):
-    """Redis configuration."""
-    host: str = Field("localhost", description="Redis host")
-    port: int = Field(6379, description="Redis port")
-    database: int = Field(0, description="Redis database number")
-    password: Optional[SecretStr] = Field(None, description="Redis password")
-    ssl: bool = Field(False, description="Use SSL for Redis connection")
-    ssl_certfile: Optional[str] = Field(None, description="SSL certificate file path")
-    ssl_keyfile: Optional[str] = Field(None, description="SSL key file path")
-    
-    @property
-    def url(self) -> str:
-        """Generate Redis connection URL."""
-        protocol = "rediss" if self.ssl else "redis"
-        if self.password:
-            password = self.password.get_secret_value()
-            return f"{protocol}://:{password}@{self.host}:{self.port}/{self.database}"
-        return f"{protocol}://{self.host}:{self.port}/{self.database}"
-    
-    class Config:
-        env_prefix = "REDIS_"
-        env_file = ".env"
-        case_sensitive = False
-
-
-class APIConfig(BaseSettings):
-    """API configuration."""
-    host: str = Field("0.0.0.0", description="API host")
-    port: int = Field(8000, description="API port")
-    workers: int = Field(4, description="Number of workers")
-    reload: bool = Field(False, description="Auto-reload on code changes")
-    debug: bool = Field(False, description="Debug mode")
-    title: str = Field("V10 TR AI API", description="API title")
-    version: str = Field("1.0.0", description="API version")
-    description: str = Field("Advanced Turkish AI Processing API", description="API description")
-    cors_origins: list = Field(["*"], description="CORS allowed origins")
-    cors_credentials: bool = Field(True, description="CORS credentials allowed")
-    cors_methods: list = Field(["*"], description="CORS allowed methods")
-    cors_headers: list = Field(["*"], description="CORS allowed headers")
-    
-    class Config:
-        env_prefix = "API_"
-        env_file = ".env"
-        case_sensitive = False
-
-
-class LoggingConfig(BaseSettings):
-    """Logging configuration."""
-    level: str = Field("INFO", description="Logging level")
-    format: str = Field(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        description="Log format"
-    )
-    log_file: Optional[str] = Field(None, description="Log file path")
-    max_bytes: int = Field(10485760, description="Max log file size (10MB)")
-    backup_count: int = Field(5, description="Number of backup log files")
-    
-    class Config:
-        env_prefix = "LOG_"
-        env_file = ".env"
-        case_sensitive = False
-
-
-class AIModelConfig(BaseSettings):
-    """AI Model configuration."""
-    model_name: str = Field("bert-base-turkish-cased", description="Model name")
-    model_path: Optional[str] = Field(None, description="Path to local model")
-    tokenizer_name: str = Field("bert-base-turkish-cased", description="Tokenizer name")
-    max_sequence_length: int = Field(512, description="Maximum sequence length")
-    batch_size: int = Field(32, description="Batch size for inference")
-    device: str = Field("cpu", description="Device to use (cpu/cuda/mps)")
-    use_gpu: bool = Field(False, description="Use GPU for inference")
-    precision: str = Field("float32", description="Model precision (float32/float16)")
-    cache_models: bool = Field(True, description="Cache downloaded models")
-    models_cache_dir: str = Field(".cache/models", description="Models cache directory")
-    
-    class Config:
-        env_prefix = "MODEL_"
-        env_file = ".env"
-        case_sensitive = False
-
-
-class SecurityConfig(BaseSettings):
-    """Security configuration."""
-    secret_key: SecretStr = Field(..., description="Secret key for signing")
-    algorithm: str = Field("HS256", description="JWT algorithm")
-    access_token_expire_minutes: int = Field(30, description="Access token expiration (minutes)")
-    refresh_token_expire_days: int = Field(7, description="Refresh token expiration (days)")
-    password_min_length: int = Field(8, description="Minimum password length")
-    hash_algorithm: str = Field("bcrypt", description="Password hashing algorithm")
-    api_key_prefix: str = Field("sk_", description="API key prefix")
-    
-    class Config:
-        env_prefix = "SECURITY_"
-        env_file = ".env"
-        case_sensitive = False
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Main application settings."""
-    
-    # Environment
-    environment: EnvironmentEnum = Field(EnvironmentEnum.DEVELOPMENT, description="Environment type")
-    debug: bool = Field(False, description="Global debug mode")
-    
-    # Sub-configurations
-    database: DatabaseConfig = DatabaseConfig()
-    redis: RedisConfig = RedisConfig()
-    api: APIConfig = APIConfig()
-    logging: LoggingConfig = LoggingConfig()
-    model: AIModelConfig = AIModelConfig()
-    security: SecurityConfig = Field(default_factory=SecurityConfig)
-    
-    # Application settings
-    app_name: str = Field("V10 TR AI", description="Application name")
-    version: str = Field("1.0.0", description="Application version")
-    timezone: str = Field("UTC", description="Application timezone")
-    max_upload_size: int = Field(104857600, description="Max upload size (100MB)")
-    temp_dir: str = Field("./temp", description="Temporary directory")
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        env_nested_delimiter = "__"
-    
-    @validator("environment", pre=True)
-    def validate_environment(cls, v: str) -> EnvironmentEnum:
-        """Validate and convert environment value."""
-        if isinstance(v, EnvironmentEnum):
-            return v
-        try:
-            return EnvironmentEnum(v.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid environment: {v}. "
-                f"Must be one of {[e.value for e in EnvironmentEnum]}"
-            )
-    
-    @validator("debug", pre=True, always=True)
-    def set_debug_from_environment(cls, v: bool, values: Dict[str, Any]) -> bool:
-        """Set debug mode based on environment if not explicitly set."""
-        if v is False and "environment" in values:
-            environment = values.get("environment")
-            if isinstance(environment, EnvironmentEnum):
-                return environment == EnvironmentEnum.DEVELOPMENT
-        return v
-    
-    @property
-    def is_development(self) -> bool:
-        """Check if in development environment."""
-        return self.environment == EnvironmentEnum.DEVELOPMENT
-    
-    @property
-    def is_production(self) -> bool:
-        """Check if in production environment."""
-        return self.environment == EnvironmentEnum.PRODUCTION
-    
-    @property
-    def is_testing(self) -> bool:
-        """Check if in testing environment."""
-        return self.environment == EnvironmentEnum.TESTING
-
-
-def load_yaml_config(config_path: str) -> Dict[str, Any]:
     """
-    Load configuration from YAML file.
+    Application settings configuration loader.
     
-    Args:
-        config_path: Path to YAML configuration file
-        
-    Returns:
-        Dictionary containing configuration
-        
-    Raises:
-        FileNotFoundError: If config file doesn't exist
-        yaml.YAMLError: If YAML parsing fails
+    Supports configuration from:
+    1. Environment variables (prefixed with APP_)
+    2. YAML configuration files
+    3. Default values
+    
+    Environment variables take precedence over YAML settings.
     """
-    config_file = Path(config_path)
     
-    if not config_file.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    # API Configuration
+    api_host: str = Field(default="0.0.0.0", description="API server host")
+    api_port: int = Field(default=8000, description="API server port")
+    api_debug: bool = Field(default=False, description="Enable debug mode")
     
-    try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        logger.info(f"Loaded configuration from {config_path}")
-        return config or {}
-    except yaml.YAMLError as e:
-        logger.error(f"Failed to parse YAML configuration: {e}")
-        raise
-
-
-def settings_customise_sources(
-    init_settings,
-    env_settings,
-    file_settings,
-) -> SettingsSourceCallable:
-    """
-    Customize settings sources priority.
-    Priority: init_settings > env_settings > file_settings
-    
-    Args:
-        init_settings: Settings from initialization
-        env_settings: Settings from environment variables
-        file_settings: Settings from file (.env)
-        
-    Returns:
-        Ordered settings sources
-    """
-    return (
-        init_settings,
-        env_settings,
-        file_settings,
+    # Database Configuration
+    database_url: str = Field(
+        default="sqlite:///./app.db",
+        description="Database connection URL"
     )
-
-
-class ConfigLoader:
-    """Configuration loader with support for multiple sources."""
+    database_echo: bool = Field(
+        default=False,
+        description="Enable SQL echo logging"
+    )
     
-    _instance: Optional["ConfigLoader"] = None
-    _settings: Optional[Settings] = None
+    # Authentication
+    secret_key: str = Field(
+        default="your-secret-key-change-in-production",
+        description="Secret key for JWT tokens"
+    )
+    algorithm: str = Field(default="HS256", description="JWT algorithm")
+    access_token_expire_minutes: int = Field(
+        default=30,
+        description="Access token expiration time in minutes"
+    )
     
-    def __new__(cls) -> "ConfigLoader":
-        """Singleton pattern implementation."""
-        if cls._instance is None:
-            cls._instance = super(ConfigLoader, cls).__new__(cls)
-        return cls._instance
+    # Application
+    app_name: str = Field(default="v10_tr_ai", description="Application name")
+    app_version: str = Field(default="1.0.0", description="Application version")
+    environment: str = Field(default="development", description="Environment (development/production/testing)")
     
-    def __init__(self):
-        """Initialize configuration loader."""
-        if self._settings is None:
-            self._load_settings()
+    # Logging
+    log_level: str = Field(default="INFO", description="Logging level")
+    log_file: Optional[str] = Field(default=None, description="Log file path (optional)")
     
-    @classmethod
-    def _load_settings(cls) -> None:
-        """Load settings from all sources."""
-        # Load .env file
-        env_file = Path(".env")
-        if env_file.exists():
-            load_dotenv(env_file)
-            logger.info("Loaded environment variables from .env")
-        
-        # Check for YAML config
-        yaml_config_path = os.getenv("CONFIG_PATH", None)
-        yaml_settings = {}
-        
-        if yaml_config_path:
-            try:
-                yaml_settings = load_yaml_config(yaml_config_path)
-            except FileNotFoundError:
-                logger.warning(f"YAML config file not found: {yaml_config_path}")
-        
-        # Merge YAML and environment settings
-        settings_dict = {**yaml_settings, **os.environ}
-        
-        try:
-            cls._settings = Settings(**settings_dict)
-            logger.info(f"Settings loaded successfully for {cls._settings.environment.value} environment")
-        except Exception as e:
-            logger.error(f"Failed to load settings: {e}")
-            # Fall back to defaults
-            cls._settings = Settings()
+    # AI/ML Configuration
+    model_name: str = Field(default="gpt-3.5-turbo", description="AI model name")
+    model_temperature: float = Field(default=0.7, description="Model temperature")
+    max_tokens: int = Field(default=2000, description="Maximum tokens for generation")
+    
+    # Optional service configurations
+    redis_url: Optional[str] = Field(default=None, description="Redis connection URL")
+    openai_api_key: Optional[str] = Field(default=None, description="OpenAI API key")
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="APP_",
+        case_sensitive=False,
+        extra="ignore",
+    )
     
     @classmethod
-    def get_settings(cls) -> Settings:
+    def from_yaml(cls, yaml_path: str | Path) -> "Settings":
         """
-        Get settings instance.
+        Load settings from a YAML configuration file.
         
+        Args:
+            yaml_path: Path to the YAML configuration file
+            
+        Returns:
+            Settings instance with values from YAML and environment variables
+            
+        Raises:
+            FileNotFoundError: If the YAML file doesn't exist
+            yaml.YAMLError: If the YAML file is malformed
+        """
+        yaml_path = Path(yaml_path)
+        
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
+        
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            yaml_data = yaml.safe_load(f) or {}
+        
+        # Environment variables override YAML settings
+        env_vars = {
+            key.replace(f"{cls.model_config['env_prefix']}", "", 1).lower(): value
+            for key, value in os.environ.items()
+            if key.startswith(cls.model_config['env_prefix'])
+        }
+        
+        # Merge YAML and environment variables (env vars take precedence)
+        config_data = {**yaml_data, **env_vars}
+        
+        return cls(**config_data)
+    
+    @classmethod
+    def from_yaml_or_env(
+        cls,
+        yaml_path: Optional[str | Path] = None,
+        default_yaml_path: str | Path = "config.yaml",
+    ) -> "Settings":
+        """
+        Load settings from YAML file if it exists, otherwise from environment.
+        
+        Args:
+            yaml_path: Explicit path to YAML configuration file
+            default_yaml_path: Default path to check for YAML configuration
+            
         Returns:
             Settings instance
         """
-        if cls._instance is None:
-            cls()
-        return cls._settings
+        # Use provided path or check default
+        config_file = yaml_path or default_yaml_path
+        config_file = Path(config_file)
+        
+        if config_file.exists():
+            return cls.from_yaml(config_file)
+        
+        # Fall back to environment variables and defaults
+        return cls()
     
-    @classmethod
-    def reload_settings(cls) -> None:
-        """Reload settings from sources."""
-        cls._settings = None
-        cls._instance = None
-        cls()
-    
-    @classmethod
-    def export_settings(cls, format: str = "json") -> str:
+    def to_dict(self) -> Dict[str, Any]:
         """
-        Export settings to specified format.
+        Convert settings to dictionary.
+        
+        Returns:
+            Dictionary representation of settings
+        """
+        return self.model_dump()
+    
+    def save_to_yaml(self, yaml_path: str | Path) -> None:
+        """
+        Save current settings to a YAML file.
         
         Args:
-            format: Output format (json/yaml)
-            
-        Returns:
-            Formatted settings string
+            yaml_path: Path where to save the YAML configuration
         """
-        if cls._settings is None:
-            cls()
+        yaml_path = Path(yaml_path)
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
         
-        settings_dict = cls._settings.dict()
-        
-        if format.lower() == "yaml":
-            return yaml.dump(settings_dict, default_flow_style=False)
-        else:
-            import json
-            return json.dumps(settings_dict, indent=2, default=str)
-
-
-# Singleton instance
-_config_loader = ConfigLoader()
-
-
-def get_settings() -> Settings:
-    """
-    Get global settings instance.
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
     
+    def __repr__(self) -> str:
+        """String representation of settings (masks sensitive values)."""
+        safe_dict = self.model_dump()
+        # Mask sensitive values
+        sensitive_keys = {"secret_key", "openai_api_key"}
+        for key in sensitive_keys:
+            if key in safe_dict and safe_dict[key]:
+                safe_dict[key] = "***MASKED***"
+        return f"Settings({safe_dict})"
+
+
+# Global settings instance (lazy loaded)
+_settings: Optional[Settings] = None
+
+
+def get_settings(yaml_path: Optional[str | Path] = None) -> Settings:
+    """
+    Get the global settings instance.
+    Loads from YAML if available, otherwise from environment variables.
+    
+    Args:
+        yaml_path: Optional path to YAML configuration file
+        
     Returns:
         Settings instance
-        
-    Example:
-        from settings import get_settings
-        settings = get_settings()
-        db_url = settings.database.url
     """
-    return ConfigLoader.get_settings()
-
-
-# Initialize settings on module import
-if __name__ == "__main__":
-    # Example usage
-    settings = get_settings()
+    global _settings
     
-    print("=" * 60)
-    print("Application Settings")
-    print("=" * 60)
-    print(f"Environment: {settings.environment.value}")
-    print(f"Debug: {settings.debug}")
-    print(f"App: {settings.app_name} v{settings.version}")
-    print(f"\nAPI Configuration:")
-    print(f"  Host: {settings.api.host}")
-    print(f"  Port: {settings.api.port}")
-    print(f"\nDatabase Configuration:")
-    print(f"  Host: {settings.database.host}")
-    print(f"  Port: {settings.database.port}")
-    print(f"  Database: {settings.database.database}")
-    print(f"\nRedis Configuration:")
-    print(f"  Host: {settings.redis.host}")
-    print(f"  Port: {settings.redis.port}")
-    print(f"\nAI Model Configuration:")
-    print(f"  Model: {settings.model.model_name}")
-    print(f"  Device: {settings.model.device}")
-    print(f"  Batch Size: {settings.model.batch_size}")
-    print("=" * 60)
+    if _settings is None:
+        _settings = Settings.from_yaml_or_env(yaml_path=yaml_path)
+    
+    return _settings
+
+
+def reload_settings(yaml_path: Optional[str | Path] = None) -> Settings:
+    """
+    Reload settings (useful for testing or dynamic configuration updates).
+    
+    Args:
+        yaml_path: Optional path to YAML configuration file
+        
+    Returns:
+        New Settings instance
+    """
+    global _settings
+    _settings = Settings.from_yaml_or_env(yaml_path=yaml_path)
+    return _settings
+
+
+# Example usage and documentation
+if __name__ == "__main__":
+    # Example 1: Load from environment variables and defaults
+    settings = get_settings()
+    print("Settings from environment and defaults:")
+    print(settings)
+    print()
+    
+    # Example 2: Load from YAML file
+    # settings = Settings.from_yaml("config.yaml")
+    # print("Settings from YAML:")
+    # print(settings)
+    # print()
+    
+    # Example 3: Load from YAML with environment variable overrides
+    # APP_API_PORT=9000 python settings.py
+    # This will use port 9000 instead of the value in config.yaml
+    
+    # Example 4: Save settings to YAML
+    # settings.save_to_yaml("config_output.yaml")
